@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>CAPITAL TERMINAL // 日本株トレードシミュレーション</title>
 <style>
 /* ==========================================================================
@@ -16,9 +16,15 @@
   --font-wide: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
 }
 *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
-html,body{height:100%; overflow:hidden;}
-body{ margin:0; background:var(--bg); color:var(--text); font-family:var(--font); overscroll-behavior:none; user-select:none; font-variant-numeric:tabular-nums; }
-#app{display:flex; flex-direction:column; height:100vh; height:100dvh; max-width:540px; margin:0 auto; position:relative; border-left:1px solid var(--line); border-right:1px solid var(--line);}
+html,body{height:100%; overflow:hidden; touch-action:manipulation;}
+body{ margin:0; background:var(--bg); color:var(--text); font-family:var(--font); overscroll-behavior:none; user-select:none; font-variant-numeric:tabular-nums; touch-action:manipulation; }
+/* スマホでの意図しないズーム(ダブルタップ・連打・ピンチ)を防止する。scroll(pan-y)は許可しつつ、
+   ズームジェスチャーだけを無効化する touch-action:manipulation を、連打されやすい操作要素すべてに明示的に適用する */
+button, .btn, .icon-btn, .qty-btn, .btn-toggle, .tab-btn, .subtab-btn,
+input, select, textarea, a, [onclick], [data-otype], [data-sub] {
+  touch-action: manipulation;
+}
+#app{display:flex; flex-direction:column; height:100vh; height:100dvh; max-width:540px; margin:0 auto; position:relative; border-left:1px solid var(--line); border-right:1px solid var(--line); touch-action:manipulation;}
 
 #topbar{ flex-shrink:0; background:#060A0F; border-bottom:1px solid var(--line); }
 #debug-banner{ display:none; flex-shrink:0; background:var(--red); color:#fff; text-align:center; font-size:10.5px; font-weight:800; letter-spacing:0.1em; padding:3px 0; font-family:var(--font-wide); }
@@ -197,7 +203,7 @@ canvas.chart{ width:100%; display:block; }
       <div class="top-controls">
         <button class="icon-btn" id="btn-debug-menu" title="開発者メニュー">&#9881;</button>
         <button class="icon-btn" id="btn-help" title="チュートリアル">?</button>
-        <button class="icon-btn" id="btn-reset" title="リセット">&#8635;</button>
+        <button class="icon-btn" id="btn-reset" title="設定・セーブデータ">&#128190;</button>
         <button class="icon-btn" id="btn-speed" title="進行速度">1x</button>
       </div>
     </div>
@@ -342,6 +348,173 @@ const MAG_RANGES = { "小幅":[0.05,0.10], "ある程度":[0.10,0.18], "大幅":
 // 四季報の企業プロフィール生成用マスタ(銘柄IDからシード生成し、常に同じ内容になる)
 const HQ_CITIES = ["東京都千代田区","東京都港区","東京都渋谷区","大阪府大阪市","愛知県名古屋市","神奈川県横浜市","福岡県福岡市","東京都新宿区","京都府京都市","宮城県仙台市"];
 const HOLDER_NAMES = ["日本カストディ信託銀行","日本マスター信託銀行","創業家一族", "みらい生命保険", "グローバル・グロース・ファンド", "北陸地方銀行連合", "自己株式(会社保有)", "海外年金基金コンソーシアム"];
+
+/* ==========================================================================
+   株主マスターデータ(単一の情報源。株価・株主構成・需給・ニュース・掲示板・
+   TOB・企業グループなど、すべての機能がこのデータを参照する)
+   ========================================================================== */
+// 株主を一度だけ生成し、以後は永続データとして保持する(画面ごとの再生成は行わない)
+function initShareholderRegistry(st){
+  const rng = mulberry32(hashStr(st.id+"_holders_master"));
+  const total = st.shares;
+  const holders = [];
+  let allocated = 0;
+  const genId = ()=> "sh_"+Math.random().toString(36).slice(2,9);
+
+  const instNames = [...HOLDER_NAMES.filter(n=>n.includes("信託")||n.includes("生命")||n.includes("銀行")||n.includes("ファンド"))].sort(()=>rng()-0.5).slice(0,3);
+  const instTotalPct = 25+rng()*30;
+  instNames.forEach((name,i)=>{
+    const pct = instTotalPct * (i===0?0.5:(i===1?0.3:0.2));
+    const shares = Math.round(total*pct/100);
+    holders.push({id:genId(), name, type:"institutional", shares, isMajor:false, isManagement:false, isFounder:false, isParent:false, isStable:true, lockup:false, isFloat:false, style:"institutional"});
+    allocated += shares;
+  });
+
+  const foreignPct = 5+rng()*20;
+  const foreignShares = Math.round(total*foreignPct/100);
+  holders.push({id:genId(), name:"海外投資家(合算)", type:"foreign", shares:foreignShares, isMajor:false, isManagement:false, isFounder:false, isParent:false, isStable:false, lockup:false, isFloat:true, style:"foreign"});
+  allocated += foreignShares;
+
+  const profile = getCompanyProfile(st);
+  const mgmtPct = 2+rng()*8;
+  const mgmtShares = Math.round(total*mgmtPct/100);
+  holders.push({id:genId(), name:profile.ceo+"(経営陣)", type:"individual", shares:mgmtShares, isMajor:false, isManagement:true, isFounder:false, isParent:false, isStable:true, lockup:true, isFloat:false, style:"longterm"});
+  allocated += mgmtShares;
+
+  if(rng()<0.4){
+    const founderPct = 3+rng()*10;
+    const founderShares = Math.round(total*founderPct/100);
+    holders.push({id:genId(), name:profile.ceo+"創業家", type:"individual", shares:founderShares, isMajor:false, isManagement:false, isFounder:true, isParent:false, isStable:true, lockup:true, isFloat:false, style:"longterm"});
+    allocated += founderShares;
+  }
+
+  if(rng()<0.5){
+    const treasuryPct = 1+rng()*4;
+    const treasuryShares = Math.round(total*treasuryPct/100);
+    holders.push({id:genId(), name:"自己株式(会社保有)", type:"company", shares:treasuryShares, isMajor:false, isManagement:false, isFounder:false, isParent:false, isStable:true, lockup:true, isFloat:false, style:"longterm"});
+    allocated += treasuryShares;
+  }
+
+  const floatSharesTotal = Math.max(0, total-allocated);
+  holders.push({id:"float_pool", name:"個人投資家(市場流通分)", type:"individual", shares:floatSharesTotal, isMajor:false, isManagement:false, isFounder:false, isParent:false, isStable:false, lockup:false, isFloat:true, style:"mixed"});
+
+  holders.forEach(h=> h.isMajor = (h.shares/total*100)>=5);
+  return holders;
+}
+// プレイヤーの実保有(state.portfolioが唯一の情報源)を、株主登録簿の明示的な1エントリとして常に同期する。
+// 通常の売買は市場流通分(float_pool)との間で受け渡しされたものとして扱う。
+function syncPlayerShareholderEntry(st){
+  const holders = st.shareholders;
+  if(!holders) return;
+  let player = holders.find(h=>h.id==="player");
+  if(!player){
+    player = {id:"player", name:"プレイヤー", type:"player", shares:0, isMajor:false, isManagement:false, isFounder:false, isParent:false, isStable:false, lockup:false, isFloat:true, style:"player"};
+    holders.push(player);
+  }
+  player.name = (state.playerName && state.playerName.trim()) || "プレイヤー";
+  const actualShares = state.portfolio[st.id] ? state.portfolio[st.id].shares : 0;
+  const delta = actualShares - player.shares;
+  if(delta !== 0){
+    const floatPool = holders.find(h=>h.id==="float_pool");
+    if(floatPool) floatPool.shares = Math.max(0, floatPool.shares-delta);
+    player.shares = actualShares;
+  }
+  player.isMajor = st.shares>0 && (player.shares/st.shares*100)>=5;
+}
+function ensureShareholderRegistry(st){
+  if(!st.shareholders || !st.shareholders.length) st.shareholders = initShareholderRegistry(st);
+  syncPlayerShareholderEntry(st);
+  return st.shareholders;
+}
+// 表示用の統合株主リスト(登録簿そのものを保有株数の降順で並べたもの。0株のエントリは除く)
+function getUnifiedShareholders(st){
+  ensureShareholderRegistry(st);
+  return st.shareholders
+    .filter(h=>h.shares>0)
+    .map(h=> h.id==="float_pool" ? {...h, name:"個人投資家(その他)"} : {...h})
+    .sort((a,b)=>b.shares-a.shares);
+}
+function playerOwnershipPct(st){
+  const pos = state.portfolio[st.id];
+  const shares = pos ? pos.shares : 0;
+  return st.shares>0 ? (shares/st.shares*100) : 0;
+}
+// 資本異動(増資・分割・自社株買い)の際、株主マスターデータの整合性を保ちながら反映する
+// 登録簿の合計が発行済株式数と厳密に一致するよう検算・是正する(安全網)。
+// 差異が生じた場合は市場流通分(個人投資家)で吸収する(現実の株式集計でも端数調整に相当する扱い)
+function reconcileShareholderRegistry(st){
+  const holders = ensureShareholderRegistry(st);
+  const sum = holders.reduce((s,h)=>s+h.shares,0);
+  const diff = st.shares - sum;
+  if(diff !== 0){
+    let floatPool = holders.find(h=>h.id==="float_pool");
+    if(!floatPool){
+      floatPool = {id:"float_pool", name:"個人投資家(市場流通分)", type:"individual", shares:0, isMajor:false, isManagement:false, isFounder:false, isParent:false, isStable:false, lockup:false, isFloat:true, style:"mixed"};
+      holders.push(floatPool);
+    }
+    floatPool.shares = Math.max(0, floatPool.shares+diff);
+  }
+  return holders;
+}
+// デバッグモード用: 株主構成データ整合性チェック(10項目)。異常があれば項目・期待値・実際値・計算式を返す
+function runShareholderConsistencyCheck(){
+  const issues = [];
+  state.stocks.forEach(st=>{
+    const holders = getUnifiedShareholders(st);
+    const sum = holders.reduce((s,h)=>s+h.shares,0);
+    if(sum!==st.shares) issues.push({item:"①全株主保有株数合計=発行済株式数", stock:st.name, expected:st.shares, actual:sum, formula:"Σ(株主.保有株数)"});
+
+    const data = getShareholderData(st);
+    const totalPct = data.institutional+data.foreign+data.individual;
+    if(Math.abs(totalPct-100)>2) issues.push({item:"②個人+機関+外国=100%", stock:st.name, expected:"100%", actual:totalPct+"%", formula:"institutional+foreign+individual"});
+
+    // ③ 大株主保有比率(非流通株式比率)がその定義式どおりに算出されているか
+    const nonFloatPctCalc = st.shares>0 ? (100 - (floatShares(st)/st.shares*100)) : 0;
+    if(Math.abs(nonFloatPctCalc-parseFloat(data.majorHolderRatio))>1) issues.push({item:"③大株主保有比率が定義式と一致", stock:st.name, expected:nonFloatPctCalc.toFixed(1)+"%", actual:data.majorHolderRatio+"%", formula:"100-(流通株式数/発行済株式数×100)"});
+
+    const pos = state.portfolio[st.id];
+    const playerShares = pos?pos.shares:0;
+    const playerPctCalc = playerOwnershipPct(st);
+    if(Math.abs(playerPctCalc-parseFloat(data.playerPct))>0.5) issues.push({item:"④プレイヤー保有株数と保有比率が一致", stock:st.name, expected:playerPctCalc.toFixed(2)+"%", actual:data.playerPct+"%", formula:"プレイヤー保有株数/発行済株式数"});
+
+    const floatCalc = floatShares(st);
+    if(floatCalc!==data.floatShareCount) issues.push({item:"⑤流通株式数と流通株式比率が一致", stock:st.name, expected:floatCalc, actual:data.floatShareCount, formula:"発行済株式数×floatRatio"});
+
+    if(Math.round(st.marginBuyOutstanding)!==data.marginBuy) issues.push({item:"⑥信用買い残=実際の信用買い建玉", stock:st.name, expected:Math.round(st.marginBuyOutstanding), actual:data.marginBuy, formula:"st.marginBuyOutstanding"});
+    if(Math.round(st.marginSellOutstanding)!==data.marginSell) issues.push({item:"⑦信用売り残=実際の信用売り建玉", stock:st.name, expected:Math.round(st.marginSellOutstanding), actual:data.marginSell, formula:"st.marginSellOutstanding"});
+
+    const majorList = holders.filter(h=>h.isMajor);
+    const sortedCheck = [...majorList].sort((a,b)=>b.shares-a.shares);
+    const isSorted = majorList.every((h,i)=>h.id===sortedCheck[i].id);
+    if(!isSorted) issues.push({item:"⑧大株主ランキングが保有株数順", stock:st.name, expected:"保有株数の降順", actual:"順序不一致", formula:"holders.sort((a,b)=>b.shares-a.shares)"});
+  });
+
+  if(state.activeTob && !state.activeTob.resolved){
+    const st = state.stocks.find(s=>s.id===state.activeTob.stockId);
+    const namedApplied = (state.activeTob.appliedHolderIds||[]).length;
+    if(state.activeTob.appliedShares<0) issues.push({item:"⑨TOB応募株数と株主データが一致", stock:st?st.name:"?", expected:"0以上", actual:state.activeTob.appliedShares, formula:"tob.appliedShares"});
+  }
+
+  state.ventures.filter(v=>v.stage==="listed").forEach(v=>{
+    const st = state.stocks.find(s=>s.id===v.listedStockId);
+    if(!st) issues.push({item:"⑩買収後の企業グループと企業データが一致", stock:v.name, expected:"対応する銘柄が存在する", actual:"銘柄が見つからない", formula:"venture.listedStockId → state.stocks"});
+  });
+
+  return issues;
+}
+function adjustShareholderRegistryForCapitalEvent(st, type, amount){
+  const holders = ensureShareholderRegistry(st);
+  const floatPool = holders.find(h=>h.id==="float_pool");
+  if(!floatPool) return;
+  if(type==="増資"){
+    floatPool.shares += amount; // 新株は市場流通分に追加され、既存株主の比率が希薄化する
+  } else if(type==="株式分割"){
+    holders.forEach(h=> h.shares = Math.round(h.shares*amount));
+  } else if(type==="自社株買い"){
+    floatPool.shares = Math.max(0, floatPool.shares-amount); // 市場流通分から買い戻す
+  }
+  holders.forEach(h=> h.isMajor = (h.shares/st.shares*100)>=5);
+}
 
 /* ==========================================================================
    投資家掲示板・市場センチメント(銘柄ごとの「市場の声」)
@@ -586,8 +759,114 @@ function canUseOCOOrders(){ return state.departments.trading.level>=4; }
 let state = null;
 const STORAGE_KEY = "capital-terminal-save-v3";
 const DEBUG_STORAGE_KEY = "capital-terminal-save-v3-debug";
+const BACKUP_STORAGE_KEY = "capital-terminal-save-v3-backup"; // 直近世代のバックアップ(既存キーはそのまま維持し、新規キーとして追加する)
+const CURRENT_SAVE_VERSION = 1; // セーブデータのバージョン管理をここから導入する(既存セーブはversion未定義=旧データとして安全に扱う)
 let isDebugMode = false; // デバッグモード(通常モードのセーブデータとは完全に分離する)
 function currentStorageKey(){ return isDebugMode ? DEBUG_STORAGE_KEY : STORAGE_KEY; }
+
+// ストレージ抽象化層: Claude Artifacts環境ではwindow.storageを、それ以外(GitHub Pagesなどでの単体公開)では
+// ブラウザのlocalStorageを自動的に使う。window.storageが存在しない環境でも確実にセーブデータが永続化される。
+const hasArtifactStorage = (typeof window!=="undefined") && !!window.storage && typeof window.storage.get==="function";
+async function storageGet(key){
+  if(hasArtifactStorage){
+    try{ const res = await window.storage.get(key, false); return (res && res.value!=null) ? res.value : null; }
+    catch(e){ return null; }
+  }
+  try{ return (typeof localStorage!=="undefined") ? localStorage.getItem(key) : null; }
+  catch(e){ return null; }
+}
+async function storageSet(key, value){
+  if(hasArtifactStorage){
+    try{ const res = await window.storage.set(key, value, false); return !!res; }
+    catch(e){ return false; }
+  }
+  try{ if(typeof localStorage!=="undefined"){ localStorage.setItem(key, value); return true; } return false; }
+  catch(e){ return false; }
+}
+async function storageDelete(key){
+  if(hasArtifactStorage){
+    try{ await window.storage.delete(key, false); return true; } catch(e){ return false; }
+  }
+  try{ if(typeof localStorage!=="undefined"){ localStorage.removeItem(key); return true; } return false; }
+  catch(e){ return false; }
+}
+
+// セーブデータとして最低限成立しているかどうかを検証する(壊れたJSONやNaN汚染などを検出する。正常なデータは一切変更しない)
+function validateSaveDataShape(data){
+  if(!data || typeof data!=="object") return false;
+  if(typeof data.cash!=="number" || !isFinite(data.cash)) return false;
+  if(typeof data.day!=="number" || !isFinite(data.day) || data.day<1) return false;
+  if(!Array.isArray(data.stocks) || data.stocks.length===0) return false;
+  if(typeof data.portfolio!=="object" || data.portfolio===null) return false;
+  return true;
+}
+
+// セーブデータのバージョン別マイグレーション。今後の構造変更はここに追記していく(古いデータを壊さず新形式へ変換する)。
+// 例: SAVE_MIGRATIONS[1] = (s)=>{ if(s.newField===undefined) s.newField = defaultValue; };
+const SAVE_MIGRATIONS = {
+  // v1時点では新規追加された構造上の変換は無い(既存の項目追加はすべてmigrateState内の「存在しなければ追加」方式で吸収する)
+};
+function runSaveVersionMigrations(){
+  if(state.saveDataVersion===undefined) state.saveDataVersion = 1; // バージョン管理導入前の既存セーブはv1として扱う(データは一切変更しない)
+  let v = state.saveDataVersion;
+  while(v<CURRENT_SAVE_VERSION){
+    if(SAVE_MIGRATIONS[v]) SAVE_MIGRATIONS[v](state);
+    v += 1;
+    state.saveDataVersion = v;
+  }
+  state.saveDataVersion = CURRENT_SAVE_VERSION;
+}
+let periodicAutosaveTimer = null;
+function startPeriodicAutosave(){
+  if(periodicAutosaveTimer) clearInterval(periodicAutosaveTimer);
+  periodicAutosaveTimer = setInterval(()=>{ saveState(); }, 45000); // 45秒ごとの定期バックアップ保存(イベント駆動の自動保存に加えた保険)
+}
+let lastBackupTime = 0;
+async function saveState(){
+  try{
+    if(state.saveDataVersion===undefined) state.saveDataVersion = CURRENT_SAVE_VERSION;
+    state.lastSavedAt = new Date().toISOString();
+    const json = JSON.stringify(state);
+    const ok = await storageSet(currentStorageKey(), json);
+    if(!ok) console.warn("保存に失敗しました");
+    // バックアップ世代を一定間隔で更新する(書き込み頻度を抑えつつ、直前の正常な状態を保持する)
+    if(!isDebugMode){
+      const now = Date.now();
+      if(now-lastBackupTime>60000){
+        lastBackupTime = now;
+        await storageSet(BACKUP_STORAGE_KEY, json);
+      }
+    }
+  } catch(e){ console.error("保存エラー:", e); }
+}
+async function loadState(){
+  let hadRawData = false;
+  // ① まず通常のセーブデータを試す
+  try{
+    const raw = await storageGet(currentStorageKey());
+    if(raw){
+      hadRawData = true;
+      const parsed = JSON.parse(raw);
+      if(validateSaveDataShape(parsed)) return {ok:true, data:parsed};
+      console.warn("セーブデータの検証に失敗しました。バックアップの確認を試みます。");
+    }
+  } catch(e){ console.warn("セーブデータの読み込みに失敗しました:", e); }
+  // ② メインが読めない/壊れている場合のみ、バックアップ世代から復元を試みる(デバッグモードは対象外)
+  if(!isDebugMode){
+    try{
+      const rawBackup = await storageGet(BACKUP_STORAGE_KEY);
+      if(rawBackup){
+        hadRawData = true;
+        const parsedBackup = JSON.parse(rawBackup);
+        if(validateSaveDataShape(parsedBackup)){
+          console.warn("メインのセーブデータが利用できなかったため、バックアップから復元しました。");
+          return {ok:true, data:parsedBackup, restoredFromBackup:true};
+        }
+      }
+    } catch(e){ /* バックアップも失敗した場合はここで終える */ }
+  }
+  return {ok:false, data:null, hadRawData};
+}
 
 // 人材の職種定義(個性を持つ9種類の専門職)。既存の"analyst"/"trader"は後方互換のため維持する
 const ROLE_DEFS = {
@@ -674,6 +953,8 @@ function makeRuntimeStock(def, listedDay){
     ipoHypeDays:0, moonshotPotential:false, // IPO直後の値動き過熱/大化け企業の芽(隠しフラグ)
     floatRatio: rand(0.35,0.75), // 発行済株式数に対する流通株式数の割合(残りは大株主保有分)
     playerNetDemand: 0, // 本日のプレイヤー純需要(株数)。翌営業日の株価に反映後リセットする
+    shareholders: null, // 株主マスターデータ(初回アクセス時に生成し、以後は永続データとして保持する)
+    marginBuyOutstanding: Math.round(def.shares*0.01), marginSellOutstanding: Math.round(def.shares*0.005), // 信用建玉(実際の残高として日々推移する)
   };
 }
 
@@ -683,6 +964,7 @@ function initState(){
   stocks.forEach(s=>{ if(Math.random()<0.08) s.moonshotPotential = true; }); // ごく低確率で「大化け企業」の芽を持つ
   const sectorList = theme.tags.map(t=>TAG_LABELS[t]||t).join("、");
   return {
+    saveDataVersion: CURRENT_SAVE_VERSION,
     playerName:"", // 必須入力(デフォルト名は使用しない)。証券会社名・投資会社名・持株会社名・ランキング等に反映する
     companyName:"キャピタル・パートナーズ",
     day:1,
@@ -719,6 +1001,7 @@ function initState(){
     ipoUnread:0, ipoJustAnnounced:false,
     ventures:[], acquisitionsUnlockNotified:false,
     rivals: generateRivals(),
+    activeTob: null,
     globalCompanies: generateGlobalCompanies(),
     legendaryFeats:{tenbagger:false, oku100:false, oku1000:false, ipoSuccess:false, worldClassCompany:false, marketDominator:false},
     pendingCelebrations:[],
@@ -731,16 +1014,6 @@ function initState(){
     brokerage:{ unlocked:false, customers:0, brokerageAUM:0, feeIncome:0, reputation:50 },
     themeFunds:{}, pendingBoardDecisions:[],
   };
-}
-
-async function saveState(){
-  try{ const res = await window.storage.set(currentStorageKey(), JSON.stringify(state), false); if(!res) console.warn("保存に失敗しました"); }
-  catch(e){ console.error("保存エラー:", e); }
-}
-async function loadState(){
-  try{ const res = await window.storage.get(currentStorageKey(), false); if(res && res.value) return JSON.parse(res.value); }
-  catch(e){ /* 未保存の場合 */ }
-  return null;
 }
 
 /* ==========================================================================
@@ -1325,32 +1598,25 @@ function getCompanyProfile(st){
   return {code, segment:segDef.label, hq, founded, employees, avgAge, avgSalary, ceo};
 }
 function getShareholderData(st){
-  const rng = mulberry32(hashStr(st.id+"_holders_"+Math.floor(state.day/10)));
-  const institutional = 25 + Math.floor(rng()*40); // 機関投資家保有比率(%)
-  const foreign = 5 + Math.floor(rng()*25);
-  const individual = Math.max(5, 100-institutional-foreign);
-  let holders = [...HOLDER_NAMES].sort(()=>rng()-0.5).slice(0,4).map((name,i)=>({
-    name, pct: Math.max(1.2, (12-i*2.3)*(0.7+rng()*0.6)), shares: 0, isPlayer:false
-  }));
-  holders.forEach(h=> h.shares = Math.round(st.shares*h.pct/100));
+  ensureShareholderRegistry(st);
+  const unified = getUnifiedShareholders(st);
+  const total = st.shares;
+  const sumBy = (typeFilter)=> unified.filter(typeFilter).reduce((s,h)=>s+h.shares,0);
+  const institutional = Math.round(sumBy(h=>h.type==="institutional")/total*100);
+  const foreign = Math.round(sumBy(h=>h.type==="foreign")/total*100);
+  const individual = Math.max(0, 100-institutional-foreign);
 
-  // プレイヤーの実際の保有株数・比率を算出し、大株主に該当する場合はリストに反映する(リアルタイム反映)
+  const holders = unified.slice(0,4).map(h=>({
+    name:h.name, shares:h.shares, pct:(h.shares/total*100).toFixed(1), isPlayer:h.type==="player"
+  }));
+
   const pos = state.portfolio[st.id];
   const playerShares = pos ? pos.shares : 0;
-  const playerPct = st.shares>0 ? (playerShares/st.shares*100) : 0;
-  if(playerPct >= 0.5){
-    const pname = (state.playerName && state.playerName.trim()) || "プレイヤー";
-    holders = holders.filter(h=>!h.isPlayer);
-    holders.push({name:pname, pct:playerPct, shares:playerShares, isPlayer:true});
-    holders.sort((a,b)=>b.pct-a.pct);
-    holders = holders.slice(0,4);
-  }
-  holders = holders.map(h=>({...h, pct: h.pct.toFixed(1)}));
+  const playerPct = playerOwnershipPct(st);
 
-  const avgVol = avg(st.history.slice(-20).map(c=>c.v||1));
-  const marginBuy = Math.round(avgVol * (0.3+rng()*1.2));
-  const marginSell = Math.round(avgVol * (0.2+rng()*1.0));
-  const shortRatio = (5 + rng()*20).toFixed(1);
+  const marginBuy = Math.round(st.marginBuyOutstanding||0);
+  const marginSell = Math.round(st.marginSellOutstanding||0);
+  const shortRatio = st.shares>0 ? (marginSell/st.shares*100).toFixed(1) : "0.0";
   const sharesOutstanding = st.shares;
   const floatShareCount = floatShares(st);
   const majorHolderRatio = (100 - (floatShareCount/sharesOutstanding*100)).toFixed(1);
@@ -1458,9 +1724,28 @@ function buyStock(stockId, qty){
   st.playerNetDemand = (st.playerNetDemand||0) + fillable;
   state.orderHistory.unshift({day:state.day, type:"buy", orderType:"成行", stockId, name:st.name, qty:fillable, requestedQty:qty, status, price:execPrice, total:cost+fee});
   if(state.orderHistory.length>80) state.orderHistory.pop();
+  checkOwnershipDisclosure(st, pos.shares-fillable, pos.shares);
   saveState();
   const statusMsg = status==="partial" ? `(一部約定:希望${fmtNum(qty)}株中${fmtNum(fillable)}株のみ)` : "";
   return {ok:true, msg:`${st.name}を${fmtNum(fillable)}株購入(成行、手数料 ${fmtYen(fee)})${statusMsg}`, filled:fillable, requested:qty, status};
+}
+// 保有比率が開示基準(5/10/20/30/40/50%)を新たに超えた場合のみニュース化する(実データに基づく大株主化の開示)
+function checkOwnershipDisclosure(st, sharesBefore, sharesAfter){
+  const thresholds = [5,10,20,30,40,50];
+  const pctBefore = st.shares>0 ? sharesBefore/st.shares*100 : 0;
+  const pctAfter = st.shares>0 ? sharesAfter/st.shares*100 : 0;
+  const pname = (state.playerName && state.playerName.trim()) || "投資家";
+  thresholds.forEach(t=>{
+    if(pctBefore<t && pctAfter>=t){
+      let label;
+      if(t>=50) label = `${pname}が${st.name}の株式の過半数を取得。経営権争いが本格化する可能性がある`;
+      else if(t>=30) label = `${pname}の${st.name}保有比率が${t}%を突破。支配権争いの様相を呈している`;
+      else if(t>=20) label = `${pname}の${st.name}保有比率が${t}%を突破。経営への影響力が増している`;
+      else if(t>=10) label = `${pname}が${st.name}株の買収観測が浮上する水準まで買い増した(保有${t}%超)`;
+      else label = `${pname}が${st.name}の大株主に浮上した(保有${t}%超)`;
+      pushNews(`【大量保有】${label}`, {stars: t>=30?5:(t>=10?4:3), kind:"confirmed", category:"venture", stockId:st.id, type:"event"});
+    }
+  });
 }
 function sellStock(stockId, qty){
   const st = state.stocks.find(s=>s.id===stockId);
@@ -1704,9 +1989,13 @@ function buildMaterialNewsEvent(){
 }
 // 資金調達イベント: 新株発行(希薄化)・株式分割(流動性向上)・自社株買い(EPS改善)による構造変化
 function applyCapitalStructureEvent(st, type){
+  if(state.activeTob && state.activeTob.stockId===st.id && !state.activeTob.resolved) return; // TOB進行中は株式数を変動させない(整合性を保つため)
+  ensureShareholderRegistry(st);
   if(type==="増資"){
     const dilutionRatio = rand(0.08,0.20);
-    st.shares = Math.round(st.shares*(1+dilutionRatio)); // 発行済株式数の増加→EPS低下・持ち株比率低下として以降の計算に自然に反映される
+    const newShares = Math.round(st.shares*dilutionRatio);
+    st.shares += newShares; // 発行済株式数の増加→EPS低下・持ち株比率低下として以降の計算に自然に反映される
+    adjustShareholderRegistryForCapitalEvent(st, "増資", newShares);
   } else if(type==="株式分割"){
     const splitRatio = pick([2,3]);
     st.shares *= splitRatio;
@@ -1716,10 +2005,14 @@ function applyCapitalStructureEvent(st, type){
     const pos = state.portfolio[st.id];
     if(pos){ pos.shares*=splitRatio; pos.avgCost/=splitRatio; }
     st.floatRatio = clamp((st.floatRatio||0.5)+0.03, 0.3, 0.85); // 分割により流動性が改善する
+    adjustShareholderRegistryForCapitalEvent(st, "株式分割", splitRatio);
   } else if(type==="自社株買い"){
     const buybackRatio = rand(0.02,0.06);
-    st.shares = Math.max(100000, Math.round(st.shares*(1-buybackRatio))); // 発行済株式数の減少→EPS改善
+    const retiredShares = Math.min(Math.round(st.shares*buybackRatio), st.shares-100000);
+    st.shares = Math.max(100000, st.shares-retiredShares); // 発行済株式数の減少→EPS改善
+    adjustShareholderRegistryForCapitalEvent(st, "自社株買い", retiredShares);
   }
+  reconcileShareholderRegistry(st);
 }
 
 /* ==========================================================================
@@ -2284,29 +2577,226 @@ function convertStockToVenture(st, stake, method){
     productPipeline:[], patents:0, overseasRegions:[],
     lastBoardMeetingDay:state.day, lastShareholderMeetingDay:state.day,
     parentVentureId:null, subsidiaries:[],
+    history:[{day:state.day, text:`${method==="hostile_tob"?"TOB(株式公開買付)":"敵対的買収"}により経営権を取得`}],
   };
 }
-// 敵対的買収: 市場で議決権(33%以上)を確保すると経営権取得を試みられる。対象企業は新株発行で対抗することがある
+
+/* ==========================================================================
+   敵対的買収・TOB(株式公開買付)システム
+   すべて実際の株価・株主マスターデータ・プレイヤー資産から算出する(独立した数字は作らない)
+   ========================================================================== */
+const TOB_PERSONA_STYLES = {institutional:"機関投資家", foreign:"外国人投資家", individual:"個人投資家", company:"安定株主", player:"プレイヤー", mixed:"個人投資家"};
+// 買収難易度(0〜1): 経営陣・安定株主比率、企業の質が高いほど困難になる
+function computeTakeoverDifficultyForStock(st){
+  const holders = getUnifiedShareholders(st);
+  const stablePct = holders.filter(h=>h.isStable).reduce((s,h)=>s+h.shares,0)/st.shares;
+  return clamp(0.2 + stablePct*0.5 + (st.quality-0.5)*0.3, 0.1, 0.9);
+}
+// 敵対的買収の各種指標をすべて実データから算出する(株主構成・保有比率・時価総額など)
+function computeTakeoverMetrics(st){
+  const holders = getUnifiedShareholders(st);
+  const total = st.shares;
+  const marketCap = st.price*st.shares;
+  const playerPct = playerOwnershipPct(st);
+  const topHolder = holders[0];
+  const majorHolders = holders.filter(h=>h.isMajor);
+  const managementPct = holders.filter(h=>h.isManagement).reduce((s,h)=>s+h.shares,0)/total*100;
+  const stablePct = holders.filter(h=>h.isStable).reduce((s,h)=>s+h.shares,0)/total*100;
+  const difficulty = computeTakeoverDifficultyForStock(st);
+  const requiredPct = 50; // 経営権取得の目安ライン(過半数)
+  const estCostAtMarket = Math.round(marketCap*(requiredPct/100 - playerPct/100 > 0 ? requiredPct/100 - playerPct/100 : 0.05) * 1.25);
+  const boardResistance = clamp(0.3 + difficulty*0.5, 0.1, 0.9);
+  const shareholderApproval = clamp(0.5 - difficulty*0.3 + (playerPct-20)/100, 0.05, 0.9);
+  return {
+    name:st.name, price:st.price, marketCap, sharesOutstanding:total, floatShareCount:floatShares(st),
+    playerShares: state.portfolio[st.id]?state.portfolio[st.id].shares:0, playerPct,
+    topHolder, majorHolders, managementPct, stablePct,
+    difficulty, boardResistance, shareholderApproval, requiredPct, estCostAtMarket,
+  };
+}
+// 敵対的買収の開始条件を判定する(不足している場合は具体的な理由を返す)
+function canStartHostileTakeover(stockId){
+  const st = state.stocks.find(s=>s.id===stockId);
+  const reasons = [];
+  if(!st) return {ok:false, reasons:["対象銘柄が見つかりません"]};
+  if(state.ventures.some(v=>v.listedStockId===stockId && v.stage!=="failed")) reasons.push("すでに経営に参加しています");
+  if(state.activeTob) reasons.push("すでに進行中のTOBがあります(同時に1件まで)");
+  if(!canUnlockAcquisitions()) reasons.push("企業買収の解放条件を満たしていません");
+  if(state.investorLevel<15) reasons.push("投資家レベル15以上が必要です");
+  const metrics = computeTakeoverMetrics(st);
+  if(metrics.playerPct<5) reasons.push(`株式保有比率が不足しています(現在${metrics.playerPct.toFixed(1)}%、目安5%以上)`);
+  if(availableCash()<metrics.estCostAtMarket*0.3) reasons.push("資金が不足しています(TOB開始には概算買付資金の一部を用意する必要があります)");
+  return {ok: reasons.length===0, reasons, metrics};
+}
+function startTOB(stockId, price, targetShares, periodDays){
+  const check = canStartHostileTakeover(stockId);
+  if(!check.ok) return {ok:false, msg:check.reasons.join(" / ")};
+  const st = state.stocks.find(s=>s.id===stockId);
+  const estCost = price*targetShares;
+  if(availableCash()<estCost) return {ok:false, msg:"買付資金が不足しています"};
+  state.reservedCash += estCost;
+  const holders = ensureShareholderRegistry(st);
+  const floatPool0 = holders.find(h=>h.id==="float_pool");
+  state.activeTob = {
+    stockId, price, targetShares, periodDays:Math.max(3,periodDays),
+    startDay: state.day, endDay: state.day+Math.max(3,periodDays),
+    appliedShares:0, resolved:false, reservedAmount:estCost,
+    defenseTriggered:null, specialEvent:null, decidedHolderIds:[], appliedHolderIds:[],
+    floatPoolUndecided: floatPool0 ? floatPool0.shares : 0, floatPoolApplied:0,
+  };
+  const premiumPct = ((price/st.price-1)*100).toFixed(1);
+  pushNews(`【TOB開始】${state.playerName||"投資家"}が${st.name}へのTOB(株式公開買付)を開始した。買付価格¥${fmtNum(price)}(プレミアム${premiumPct}%)、買付予定${fmtNum(targetShares)}株。`, {stars:5, kind:"confirmed", category:"venture", stockId:st.id, type:"event"});
+  state.stats.tobStartedCount = (state.stats.tobStartedCount||0)+1;
+  saveState();
+  return {ok:true, msg:"TOBを開始しました"};
+}
+// NPC株主の投資スタイルに基づく応募判断(同じ条件でも株主によって判断が異なる)
+function npcShareholderDecision(holder, st, tob){
+  const premiumPct = (tob.price/st.price-1)*100;
+  let score = 0;
+  score += clamp(premiumPct/30, -0.35, 0.6);
+  score += (st.quality<0.4 ? 0.2 : -0.1);
+  score += (holder.style==="foreign" ? 0.15 : 0);
+  score += (holder.style==="mixed" ? 0.15 : 0);
+  score += (holder.isStable ? -0.45 : 0);
+  score += (holder.isManagement ? -0.35 : 0);
+  score += (holder.isFounder ? -0.4 : 0);
+  score += rand(-0.2,0.2);
+  return score>0;
+}
+function accumulateNpcApplications(st, tob){
+  const holders = ensureShareholderRegistry(st);
+  const dailyChance = 2/tob.periodDays;
+  if(!tob.appliedHolderIds) tob.appliedHolderIds = [];
+  if(tob.floatPoolApplied===undefined) tob.floatPoolApplied = 0;
+  holders.forEach(h=>{
+    if(h.id==="float_pool") return; // 市場流通分はプレイヤー以外の個人投資家の集合のため、応募判断は下記で別途扱う
+    if(h.lockup) return; // ロックアップ中は応募不可
+    if(state.activeTob.decidedHolderIds.includes(h.id)) return;
+    if(Math.random()>dailyChance) return;
+    state.activeTob.decidedHolderIds.push(h.id);
+    if(npcShareholderDecision(h, st, tob)){ tob.appliedShares += h.shares; tob.appliedHolderIds.push(h.id); }
+  });
+  // 市場流通分(個人投資家)は、まだ判断していない残数から毎日一定割合が判断を下す(同じ株式が二重に判断されないようにする)
+  if(tob.floatPoolUndecided===undefined){
+    const floatPool = holders.find(h=>h.id==="float_pool");
+    tob.floatPoolUndecided = floatPool ? floatPool.shares : 0;
+  }
+  if(tob.floatPoolUndecided>0){
+    const portion = Math.min(tob.floatPoolUndecided, Math.round(tob.floatPoolUndecided * dailyChance * 0.6));
+    if(portion>0){
+      tob.floatPoolUndecided -= portion;
+      if(npcShareholderDecision({isStable:false, style:"mixed"}, st, tob)){
+        tob.appliedShares += portion;
+        tob.floatPoolApplied += portion;
+      }
+    }
+  }
+}
+// 買収防衛策(低確率で発動)
+function triggerDefenseMeasure(st, tob){
+  const measures = ["ホワイトナイト","第三者割当増資","自社株買い","新株予約権(ポイズンピル)","大株主への協力要請","株主還元強化","買収反対キャンペーン"];
+  const measure = pick(measures);
+  tob.defenseTriggered = measure;
+  if(measure==="第三者割当増資"){
+    applyCapitalStructureEvent(st, "増資");
+    pushNews(`${st.name}がTOBへの対抗策として第三者割当増資を実施した。プレイヤーの持株比率が希薄化した。`, {stars:4, kind:"confirmed", category:"venture", stockId:st.id, type:"event"});
+  } else if(measure==="自社株買い"){
+    applyCapitalStructureEvent(st, "自社株買い");
+    pushNews(`${st.name}がTOBへの対抗策として自社株買いを実施した。`, {stars:4, kind:"confirmed", category:"venture", stockId:st.id, type:"event"});
+  } else if(measure==="ホワイトナイト"){
+    pushNews(`${st.name}にホワイトナイト(友好的な買収者)が現れた。既存株主の一部が防衛に協力する構えを見せている。`, {stars:4, kind:"confirmed", category:"venture", stockId:st.id, type:"event"});
+  } else {
+    pushNews(`${st.name}の経営陣がTOBに対する防衛策(${measure})を発表した。`, {stars:3, kind:"confirmed", category:"venture", stockId:st.id, type:"event"});
+  }
+}
+// TOB期間中の低確率な特殊イベント
+function triggerTobSpecialEvent(st, tob){
+  const events = ["対抗TOB出現","海外ファンド参入","経営陣辞任表明","大株主が買収を支持","思惑買いで株価急騰"];
+  const ev = pick(events);
+  tob.specialEvent = ev;
+  if(ev==="大株主が買収を支持"){
+    const holders = ensureShareholderRegistry(st);
+    const stable = holders.filter(h=>h.isStable && !state.activeTob.decidedHolderIds.includes(h.id));
+    if(stable.length){ const h=pick(stable); state.activeTob.decidedHolderIds.push(h.id); tob.appliedShares += h.shares; }
+    pushNews(`${st.name}の大株主がTOBへの賛同を表明した。`, {stars:4, kind:"confirmed", category:"venture", stockId:st.id, type:"good"});
+  } else if(ev==="思惑買いで株価急騰"){
+    const band = getPriceLimitBand(st.price);
+    st.prevPrice = st.price; st.price = Math.min(st.price+band, tob.price);
+    pushNews(`${st.name}の株価がTOB思惑で急騰している。`, {stars:4, kind:"confirmed", category:"venture", stockId:st.id, type:"good"});
+  } else {
+    pushNews(`${st.name}のTOBを巡り「${ev}」の動きが観測されている。`, {stars:3, kind:"confirmed", category:"venture", stockId:st.id, type:"event"});
+  }
+}
+function updateActiveTob(){
+  const tob = state.activeTob;
+  if(!tob || tob.resolved) return;
+  const st = state.stocks.find(s=>s.id===tob.stockId);
+  if(!st){ state.reservedCash=Math.max(0,state.reservedCash-tob.reservedAmount); state.activeTob=null; return; }
+
+  if(!tob.defenseTriggered && Math.random()<0.04) triggerDefenseMeasure(st, tob);
+  if(!tob.specialEvent && Math.random()<0.015) triggerTobSpecialEvent(st, tob);
+  accumulateNpcApplications(st, tob);
+
+  if(state.day>=tob.endDay) resolveTOB(tob, st);
+}
+function resolveTOB(tob, st){
+  tob.resolved = true;
+  const pos = state.portfolio[st.id];
+  const playerShares = pos ? pos.shares : 0;
+  const totalControlled = playerShares + tob.appliedShares;
+  const controlPct = totalControlled/st.shares*100;
+  const difficulty = computeTakeoverDifficultyForStock(st);
+  const boardResistance = clamp(0.3+difficulty*0.5 - (tob.defenseTriggered?0.15:0), 0.1, 0.85);
+  const approvalProb = clamp(0.10 + (controlPct-30)/100*1.3 - boardResistance*0.3, 0.03, 0.93);
+  const passesThreshold = controlPct>=34;
+  const success = passesThreshold && Math.random()<approvalProb;
+
+  state.reservedCash = Math.max(0, state.reservedCash-tob.reservedAmount);
+
+  if(success){
+    const actualCost = tob.price*tob.appliedShares;
+    state.cash -= actualCost;
+    if(tob.appliedShares>0){
+      const holders = ensureShareholderRegistry(st); // まず現時点の実保有で登録簿を同期する
+      if(pos){ pos.shares += tob.appliedShares; pos.avgCost = (pos.avgCost*playerShares + actualCost)/(playerShares+tob.appliedShares); }
+      else state.portfolio[st.id] = {shares:tob.appliedShares, avgCost:tob.price};
+      // 実際に応募した株主(個別株主)から株式を移転する(登録簿の合計は常に発行済株式数と一致させる)
+      (tob.appliedHolderIds||[]).forEach(hid=>{
+        const h = holders.find(x=>x.id===hid);
+        if(h) h.shares = 0; // 応募した株主は全株をTOBに応じて手放す(簡易化)
+      });
+      const floatPool = holders.find(h=>h.id==="float_pool");
+      if(floatPool) floatPool.shares = Math.max(0, floatPool.shares-(tob.floatPoolApplied||0));
+      // プレイヤーの登録簿エントリを取得後の実保有株数に合わせて更新する(他エントリから移転した分をここで反映する)
+      const playerEntry = holders.find(h=>h.id==="player");
+      if(playerEntry) playerEntry.shares = state.portfolio[st.id].shares;
+      else holders.push({id:"player", name:(state.playerName||"プレイヤー"), type:"player", shares:state.portfolio[st.id].shares, isMajor:true, isManagement:false, isFounder:false, isParent:false, isStable:false, lockup:false, isFloat:true, style:"player"});
+    }
+    const venture = convertStockToVenture(st, (playerShares+tob.appliedShares)/st.shares, "hostile_tob");
+    state.ventures.push(venture);
+    state.stats.acquisitionCount = (state.stats.acquisitionCount||0)+1;
+    state.stats.tobSuccessCount = (state.stats.tobSuccessCount||0)+1;
+    state.stats.maxTobPremium = Math.max(state.stats.maxTobPremium||0, (tob.price/st.prevPrice-1)*100);
+    state.stats.maxTobCost = Math.max(state.stats.maxTobCost||0, actualCost);
+    pushNews(`【TOB成立】${st.name}の経営権を取得した(応募${fmtNum(tob.appliedShares)}株、支配比率${controlPct.toFixed(1)}%)。`, {stars:5, kind:"confirmed", category:"venture", stockId:st.id, type:"good"});
+    queueCelebration("敵対的買収成功!", `${st.name}のTOBが成立し、経営権を取得した。企業グループに加わった。`);
+  } else {
+    let reason;
+    if(!passesThreshold) reason = "応募株数不足";
+    else if(tob.defenseTriggered) reason = `${tob.defenseTriggered}による防衛成功`;
+    else reason = "株主総会で否決";
+    pushNews(`【TOB不成立】${st.name}へのTOBは不成立に終わった(${reason})。保有株式は大株主として維持される。`, {stars:4, kind:"confirmed", category:"venture", stockId:st.id, type:"event"});
+  }
+  reconcileShareholderRegistry(st); // 登録簿の合計が発行済株式数と厳密に一致するよう最終検算する
+  state.activeTob = null;
+  saveState();
+}
+// 旧仕様との互換用の簡易入口(即座に標準的なTOBを1回だけ試みる、UIからは基本的にstartTOBを使う)
 function attemptHostileTakeover(stockId){
   const st = state.stocks.find(s=>s.id===stockId);
   if(!st) return {ok:false, msg:"銘柄が見つかりません"};
-  if(state.ventures.some(v=>v.listedStockId===stockId && v.stage!=="failed")) return {ok:false, msg:"すでに経営に参加しています"};
-  const pos = state.portfolio[stockId];
-  const pct = pos ? pos.shares/st.shares*100 : 0;
-  if(pct<33) return {ok:false, msg:`議決権確保には発行済株式数の33%以上の保有が必要です(現在${pct.toFixed(1)}%)`};
-
-  if(Math.random()<0.3){
-    applyCapitalStructureEvent(st, "増資");
-    pushNews(`${st.name}が敵対的買収への対抗策として新株を発行した。持株比率が希薄化した。`, {stars:4, kind:"confirmed", category:"venture", stockId:st.id, type:"event"});
-    return {ok:false, msg:"対象企業が防衛策(新株発行)を実施し、経営権取得に失敗しました"};
-  }
-
-  const venture = convertStockToVenture(st, state.portfolio[stockId].shares/st.shares, "hostile");
-  state.ventures.push(venture);
-  state.stats.acquisitionCount = (state.stats.acquisitionCount||0)+1;
-  pushNews(`【敵対的買収】${st.name}の経営権を取得した。`, {stars:5, kind:"confirmed", category:"venture", stockId:st.id, type:"good"});
-  saveState();
-  return {ok:true, msg:"経営権を取得しました"};
+  return startTOB(stockId, Math.round(st.price*1.25), Math.max(TRADING_UNIT, Math.round(st.shares*0.15/100)*100), 14);
 }
 
 // 子会社化: 上場企業(持株会社)が非上場企業を傘下に収め、企業グループを形成する
@@ -2692,6 +3182,29 @@ function triggerShareholderEvent(v){
   pushNews(`${v.name}に株主からの声が届いている:「${q.question}」`, {stars:3, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"flavor"});
 }
 
+// 企業グループのシナジー(テーマの組み合わせに応じて売上・研究開発力にボーナスを与える)
+const SYNERGY_PAIRS = [
+  {tags:["ai","datacenter"], label:"AIサービス強化", revenueMult:1.015, qualityBonus:0.01},
+  {tags:["semiconductor","ai"], label:"AI半導体開発", revenueMult:1.02, qualityBonus:0.012},
+  {tags:["defense","space"], label:"防衛・宇宙事業拡大", revenueMult:1.015, qualityBonus:0.008},
+  {tags:["bio","robot"], label:"医療ロボティクス展開", revenueMult:1.012, qualityBonus:0.01},
+  {tags:["energy","materials"], label:"次世代素材・エネルギー融合", revenueMult:1.01, qualityBonus:0.008},
+];
+function applyGroupSynergy(parent){
+  if(!parent.subsidiaries || !parent.subsidiaries.length) return;
+  const subs = parent.subsidiaries.map(id=>state.ventures.find(v=>v.id===id)).filter(v=>v && v.stage!=="failed");
+  if(!subs.length) return;
+  const allTags = new Set([...(parent.themeTags||[])]);
+  subs.forEach(s=> (s.themeTags||[]).forEach(t=>allTags.add(t)));
+  SYNERGY_PAIRS.forEach(syn=>{
+    if(syn.tags.every(t=>allTags.has(t))){
+      const pt = ventureTarget(parent);
+      pt.revenue *= syn.revenueMult;
+      pt.quality = clamp(pt.quality+syn.qualityBonus, 0, 1);
+      subs.forEach(s=>{ const st_=ventureTarget(s); st_.revenue *= syn.revenueMult; });
+    }
+  });
+}
 function updateVentures(){
   state.ventures.forEach(v=>{
     if(v.stage!=="private" && v.stage!=="listed") return;
@@ -2717,6 +3230,7 @@ function updateVentures(){
 
     if(state.day - v.lastEventDay < randInt(28,42)) return;
     v.lastEventDay = state.day;
+    if(v.stage==="listed" && v.subsidiaries && v.subsidiaries.length) applyGroupSynergy(v);
     const p = VENTURE_POLICIES[v.policy] || VENTURE_POLICIES.growth;
     const execBonus = ventureExecBonus(v);
     const t = ventureTarget(v);
@@ -3117,6 +3631,14 @@ function advanceDay(){
     if(isThemeMatch(st)) changePct += (state.theme.flowPct/100)*0.005;
     // 投資家掲示板の市場心理: あくまで一要素として、ごく小さく株価に反映する(心理だけで株価は決まらない)
     changePct += computeStockSentiment(st) * 0.004;
+    // TOB進行中は、成立期待の強さに応じて株価がTOB価格を意識して動く
+    if(state.activeTob && state.activeTob.stockId===st.id && !state.activeTob.resolved){
+      const tob = state.activeTob;
+      const gapToTob = (tob.price - dayOpen)/dayOpen;
+      const controlPct = ((state.portfolio[st.id]?state.portfolio[st.id].shares:0)+tob.appliedShares)/st.shares;
+      const expectationStrength = clamp(controlPct*1.5, 0, 0.8); // 成立期待が高いほどTOB価格へ引き寄せられる
+      changePct += gapToTob*expectationStrength*0.15;
+    }
     if(instEvent && instEvent.stockId===st.id) changePct += instEvent.impactPct;
     if(materialEvent && materialEvent.stockId===st.id) changePct += materialEvent.impactPct;
 
@@ -3173,6 +3695,14 @@ function advanceDay(){
 
     st.prevPrice = dayOpen;
     st.price = dayClose;
+
+    // 信用建玉(買い残・売り残)を実際の値動きに応じて更新する(画面表示のたびのランダム生成ではなく、日々推移する実データ)
+    {
+      const chg = (dayClose-dayOpen)/dayOpen;
+      const recentVol = avg(st.history.slice(-10).map(c=>c.v||1)) || (st.shares*0.002);
+      st.marginBuyOutstanding = clamp((st.marginBuyOutstanding||0) + Math.round(recentVol*chg*2.2), 0, recentVol*8);
+      st.marginSellOutstanding = clamp((st.marginSellOutstanding||0) - Math.round(recentVol*chg*1.6), 0, recentVol*6);
+    }
 
     const bodyRange = Math.abs(dayClose-dayOpen);
     const wick = dayOpen*(st.volatility/100)*rand(0.15,0.55) + bodyRange*rand(0.15,0.45);
@@ -3250,6 +3780,7 @@ function advanceDay(){
   updateVentures();
   checkVentureListings();
   updateRivals();
+  updateActiveTob();
   updateMarketSentiment();
   updateGlobalCompanies();
   checkLegendaryFeats();
@@ -4415,7 +4946,7 @@ function renderStockModal(){
   const linkedVenture = state.ventures.find(v=>v.listedStockId===st.id && v.stage==="listed");
   const ventureBadge = linkedVenture ? `<span class="badge gain">あなたが育てた企業</span>` : "";
   const playerVotingPct = pos ? (pos.shares/st.shares*100) : 0;
-  const canHostileTakeover = !linkedVenture && playerVotingPct>=33 && canUnlockAcquisitions();
+  const showTakeoverEntry = !linkedVenture && playerVotingPct>=5 && canUnlockAcquisitions();
 
   modal.innerHTML = `
     <div class="modal-handle"></div>
@@ -4429,7 +4960,7 @@ function renderStockModal(){
     </div>
     <div id="stock-modal-badges" style="margin-bottom:4px; display:flex; gap:5px; flex-wrap:wrap;">${themeBadge}${rumorBadge}${stopBadge}${ventureBadge}</div>
     ${linkedVenture ? `<button class="btn btn-ghost btn-block btn-sm" id="btn-manage-venture" style="margin-bottom:8px;">この企業を経営する →</button>` : ''}
-    ${canHostileTakeover ? `<button class="btn btn-red btn-block btn-sm" id="btn-hostile-takeover" style="margin-bottom:8px;">敵対的買収で経営権を取得する(保有${playerVotingPct.toFixed(1)}%)</button>` : ''}
+    ${showTakeoverEntry ? `<button class="btn btn-red btn-block btn-sm" id="btn-open-takeover" style="margin-bottom:8px;">M&A:敵対的買収を検討する(保有${playerVotingPct.toFixed(1)}%)</button>` : ''}
 
     <div class="subtab-row">
       <button class="subtab-btn ${modalSubtab==='chart'?'active':''}" data-sub="chart">チャート</button>
@@ -4449,13 +4980,8 @@ function renderStockModal(){
   modal.querySelectorAll('[data-sub]').forEach(b=>{ b.onclick = ()=>{ switchModalSubtab(b.dataset.sub); }; });
   const manageBtn = modal.querySelector('#btn-manage-venture');
   if(manageBtn) manageBtn.onclick = ()=>{ openVentureModal(linkedVenture.id); };
-  const hostileBtn = modal.querySelector('#btn-hostile-takeover');
-  if(hostileBtn) hostileBtn.onclick = ()=>{
-    if(!confirm('敵対的買収を仕掛けますか?対象企業が新株発行などの対抗策を取る可能性があります。')) return;
-    const r = attemptHostileTakeover(st.id);
-    toast(r.msg);
-    render(); renderStockModal();
-  };
+  const takeoverBtn = modal.querySelector('#btn-open-takeover');
+  if(takeoverBtn) takeoverBtn.onclick = ()=>{ openTakeoverModal(st.id); };
 
   renderModalSubbody(st);
   renderOrderForm(st, owned, availShares);
@@ -4985,6 +5511,102 @@ function renderIpoModal(){
 }
 
 // 企業買収の詳細モーダル(非上場企業の企業情報確認・買収実行)
+// M&A → 敵対的買収の専用画面。すべての指標は実際の株価・株主データから算出する
+function openTakeoverModal(stockId){ showModal(); renderTakeoverModal(stockId); }
+function renderTakeoverModal(stockId){
+  const st = state.stocks.find(s=>s.id===stockId);
+  const modal = document.getElementById('modal');
+  if(!st){ modal.innerHTML = `<div class="modal-handle"></div><div class="empty-state">銘柄が見つかりません</div>`; return; }
+
+  const activeTobHere = state.activeTob && state.activeTob.stockId===stockId && !state.activeTob.resolved;
+  if(activeTobHere){
+    const tob = state.activeTob;
+    const daysLeft = tob.endDay-state.day;
+    const controlPct = ((state.portfolio[st.id]?state.portfolio[st.id].shares:0)+tob.appliedShares)/st.shares*100;
+    modal.innerHTML = `
+      <div class="modal-handle"></div>
+      <div class="modal-header"><div class="modal-title">TOB進行中:${st.name}</div><button class="modal-close" id="modal-close">✕</button></div>
+      <table class="dtable">
+        <tr><td>買付価格</td><td>¥${fmtNum(tob.price)}(プレミアム${((tob.price/st.price-1)*100).toFixed(1)}%)</td></tr>
+        <tr><td>買付予定株数</td><td>${fmtNum(tob.targetShares)}株</td></tr>
+        <tr><td>応募済み株数</td><td>${fmtNum(tob.appliedShares)}株</td></tr>
+        <tr><td>現在の支配比率(見込み)</td><td>${controlPct.toFixed(1)}%</td></tr>
+        <tr><td>残り期間</td><td>${daysLeft}日</td></tr>
+        <tr><td>防衛策</td><td>${tob.defenseTriggered||"(なし)"}</td></tr>
+        <tr><td>特殊イベント</td><td>${tob.specialEvent||"(なし)"}</td></tr>
+      </table>
+      <div style="font-size:10.5px; color:var(--muted); margin-top:10px; line-height:1.7; font-family:var(--font-wide);">株主が日々応募を判断しています。期間終了時に成立可否が決まります。</div>
+    `;
+    modal.querySelector('#modal-close').onclick = closeModal;
+    return;
+  }
+
+  const m = computeTakeoverMetrics(st);
+  const check = canStartHostileTakeover(stockId);
+  const stars = (v)=> "★".repeat(Math.round(v*5))+"☆".repeat(5-Math.round(v*5));
+  const defaultPrice = Math.round(st.price*1.25);
+  const defaultShares = Math.max(TRADING_UNIT, Math.ceil(st.shares*Math.max(0.15, (m.requiredPct-m.playerPct)/100+0.1)/100)*100);
+
+  modal.innerHTML = `
+    <div class="modal-handle"></div>
+    <div class="modal-header"><div class="modal-title">M&A:敵対的買収</div><button class="modal-close" id="modal-close">✕</button></div>
+    <div style="font-size:13px; font-weight:800; margin:6px 0;">${m.name}</div>
+    <table class="dtable">
+      <tr><td>株価</td><td>¥${fmtNum(m.price)}</td></tr>
+      <tr><td>時価総額</td><td>${fmtYen(m.marketCap)}</td></tr>
+      <tr><td>発行済株式数</td><td>${fmtNum(m.sharesOutstanding)}株</td></tr>
+      <tr><td>流通株式数</td><td>${fmtNum(m.floatShareCount)}株</td></tr>
+      <tr><td>プレイヤー保有株数</td><td>${fmtNum(m.playerShares)}株</td></tr>
+      <tr><td>プレイヤー保有比率</td><td>${m.playerPct.toFixed(2)}%</td></tr>
+      <tr><td>筆頭株主</td><td>${m.topHolder.name}(${(m.topHolder.shares/m.sharesOutstanding*100).toFixed(1)}%)</td></tr>
+      <tr><td>大株主数</td><td>${m.majorHolders.length}者</td></tr>
+      <tr><td>経営陣保有比率</td><td>${m.managementPct.toFixed(1)}%</td></tr>
+      <tr><td>安定株主比率</td><td>${m.stablePct.toFixed(1)}%</td></tr>
+      <tr><td>買収難易度</td><td>${stars(m.difficulty)}</td></tr>
+      <tr><td>経営陣の抵抗度</td><td>${stars(m.boardResistance)}</td></tr>
+      <tr><td>株主の買収賛成度(目安)</td><td>${stars(m.shareholderApproval)}</td></tr>
+      <tr><td>必要取得比率(目安)</td><td>${m.requiredPct}%</td></tr>
+      <tr><td>推定買収資金</td><td>${fmtYen(m.estCostAtMarket)}</td></tr>
+    </table>
+    <div style="height:14px;"></div>
+    ${check.ok ? `
+      <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>TOB(株式公開買付)を開始する</h2></div>
+      <div class="price-input-row"><label>買付価格</label><input type="number" id="tob-price" value="${defaultPrice}"></div>
+      <div style="font-size:9.5px; color:var(--muted-2); text-align:right; margin:-4px 0 6px; font-family:var(--font-wide);" id="tob-premium-hint"></div>
+      <div class="price-input-row"><label>買付予定株数</label><input type="number" id="tob-shares" value="${defaultShares}" step="100"></div>
+      <div class="price-input-row"><label>買付期間(日)</label><input type="number" id="tob-period" value="14" min="3" max="30"></div>
+      <div style="font-size:9.5px; color:var(--muted-2); text-align:right; margin-top:2px; font-family:var(--font-wide);" id="tob-cost-hint"></div>
+      <button class="btn btn-red btn-block" id="btn-start-tob" style="margin-top:10px;">TOBを開始する</button>
+    ` : `
+      <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>TOB開始条件を満たしていません</h2></div>
+      <div style="padding:8px 0; font-size:11.5px; color:var(--red); line-height:1.8; font-family:var(--font-wide);">
+        ${check.reasons.map(r=>`・${r}`).join("<br>")}
+      </div>
+    `}
+  `;
+  modal.querySelector('#modal-close').onclick = closeModal;
+  const priceInput = modal.querySelector('#tob-price');
+  const sharesInput = modal.querySelector('#tob-shares');
+  const periodInput = modal.querySelector('#tob-period');
+  if(priceInput){
+    const updateHints = ()=>{
+      const p = parseFloat(priceInput.value)||st.price;
+      const s = parseInt(sharesInput.value)||0;
+      modal.querySelector('#tob-premium-hint').textContent = `現在株価に対するプレミアム: ${((p/st.price-1)*100).toFixed(1)}%`;
+      modal.querySelector('#tob-cost-hint').textContent = `概算必要資金: ${fmtYen(p*s)} / 利用可能資金: ${fmtYen(availableCash())}`;
+    };
+    priceInput.addEventListener('input', updateHints);
+    sharesInput.addEventListener('input', updateHints);
+    updateHints();
+    modal.querySelector('#btn-start-tob').onclick = ()=>{
+      if(!confirm('TOBを開始しますか?対象企業が防衛策を取る可能性があります。')) return;
+      const r = startTOB(stockId, parseFloat(priceInput.value)||st.price, parseInt(sharesInput.value)||0, parseInt(periodInput.value)||14);
+      toast(r.msg);
+      if(r.ok){ closeModal(); render(); }
+    };
+  }
+}
+
 function openAcquisitionModal(companyId){
   showModal();
   renderAcquisitionModal(companyId);
@@ -5632,6 +6254,13 @@ function showModal(){ document.getElementById('modal-overlay').classList.add('sh
 function closeModal(){ document.getElementById('modal-overlay').classList.remove('show'); modalStockId=null; }
 document.getElementById('modal-overlay').addEventListener('click',(e)=>{ if(e.target.id==='modal-overlay' && !blockModalDismiss) closeModal(); });
 
+// スマホでの意図しないズームを防止する(viewport設定・CSSのtouch-actionに加えた保険)。
+// gesturestart/change/end はSafari独自のピンチズームジェスチャーイベントで、click/touchendには一切影響しないため、
+// ボタンのタップ・連打などゲーム操作を阻害することなく、ピンチズームだけを確実に無効化できる。
+["gesturestart","gesturechange","gestureend"].forEach(evt=>{
+  document.addEventListener(evt, (e)=>{ e.preventDefault(); }, {passive:false});
+});
+
 let toastTimer=null;
 function toast(msg){
   if(!msg) return;
@@ -5751,14 +6380,7 @@ document.getElementById('btn-speed').addEventListener('click', ()=>{
   startGameLoop(); saveState(); renderTopbar();
 });
 document.getElementById('btn-help').addEventListener('click', ()=> openTutorial());
-document.getElementById('btn-reset').addEventListener('click', ()=>{
-  if(confirm("ゲームを最初からやり直しますか?この操作は取り消せません。")){
-    state = initState();
-    saveState(); render(); startGameLoop();
-    toast("新しいゲームを開始しました");
-    openTutorial();
-  }
-});
+document.getElementById('btn-reset').addEventListener('click', ()=>{ openSettingsModal(); });
 
 /* ==========================================================================
    デバッグモード(開発・検証専用。通常モードのセーブデータとは完全に分離される)
@@ -5866,6 +6488,105 @@ function debugForceDelist(stockId){
   return {ok:true, msg:`${name}を強制上場廃止させました`};
 }
 
+/* ==========================================================================
+   設定・セーブデータ管理(バックアップ書き出し/復元/削除)
+   ========================================================================== */
+function openSettingsModal(){ showModal(); renderSettingsModal(); }
+function renderSettingsModal(){
+  const modal = document.getElementById('modal');
+  const savedAt = state.lastSavedAt ? new Date(state.lastSavedAt).toLocaleString('ja-JP') : "未保存";
+  modal.innerHTML = `
+    <div class="modal-handle"></div>
+    <div class="modal-header"><div class="modal-title">設定・セーブデータ</div><button class="modal-close" id="modal-close">✕</button></div>
+
+    <table class="dtable">
+      <tr><td>プレイヤー名</td><td>${state.playerName||"(未設定)"}</td></tr>
+      <tr><td>セーブデータVer.</td><td>${state.saveDataVersion||1}</td></tr>
+      <tr><td>最終保存日時</td><td>${savedAt}</td></tr>
+      <tr><td>ゲーム内日数</td><td>${state.day}日目</td></tr>
+    </table>
+
+    <div style="height:14px;"></div>
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>バックアップ</h2></div>
+    <div style="padding:10px 0; display:flex; flex-direction:column; gap:8px;">
+      <button class="btn btn-cyan btn-block btn-sm" id="btn-export-save">セーブデータをバックアップ(JSON書き出し)</button>
+      <button class="btn btn-ghost btn-block btn-sm" id="btn-import-save">セーブデータを復元(JSON読み込み)</button>
+      <input type="file" id="import-file-input" accept="application/json" style="display:none;">
+    </div>
+
+    <div style="height:10px;"></div>
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>セーブデータの削除</h2></div>
+    <div style="padding:10px 0;">
+      <div style="font-size:10.5px; color:var(--muted); line-height:1.7; margin-bottom:8px; font-family:var(--font-wide);">削除前に自動でバックアップが作成されます。それでも元に戻せない操作です。</div>
+      <button class="btn btn-red btn-block btn-sm" id="btn-delete-save">セーブデータを削除して最初からプレイ</button>
+    </div>
+  `;
+  modal.querySelector('#modal-close').onclick = closeModal;
+
+  modal.querySelector('#btn-export-save').onclick = ()=>{ exportSaveDataAsJSON(); };
+
+  const fileInput = modal.querySelector('#import-file-input');
+  modal.querySelector('#btn-import-save').onclick = ()=>{ fileInput.click(); };
+  fileInput.addEventListener('change', async (e)=>{
+    const file = e.target.files && e.target.files[0];
+    if(!file) return;
+    const r = await importSaveDataFromFile(file);
+    toast(r.msg);
+    if(r.ok){ closeModal(); render(); }
+    fileInput.value = "";
+  });
+
+  modal.querySelector('#btn-delete-save').onclick = ()=>{
+    if(!confirm("本当にセーブデータを削除しますか?この操作は元に戻せません。")) return;
+    if(!confirm("最終確認:本当によろしいですか?削除前にバックアップは作成されますが、通常のプレイでは復元できません。")) return;
+    deleteSaveDataAndRestart();
+  };
+}
+// セーブデータをJSON形式でダウンロードする(バックアップ)
+function exportSaveDataAsJSON(){
+  try{
+    const json = JSON.stringify(state, null, 2);
+    const blob = new Blob([json], {type:"application/json"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const dateStr = new Date().toISOString().slice(0,10);
+    a.href = url;
+    a.download = `stock-game-save-${dateStr}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast("セーブデータを書き出しました");
+  } catch(e){ toast("バックアップの書き出しに失敗しました"); }
+}
+// JSONファイルからセーブデータを復元する。形式検証・バージョン確認・マイグレーション・復元前バックアップを行う
+async function importSaveDataFromFile(file){
+  let text;
+  try{ text = await file.text(); } catch(e){ return {ok:false, msg:"ファイルの読み込みに失敗しました"}; }
+  let parsed;
+  try{ parsed = JSON.parse(text); } catch(e){ return {ok:false, msg:"JSON形式が正しくありません"}; }
+  if(!validateSaveDataShape(parsed)) return {ok:false, msg:"セーブデータの形式が不正です。復元を中止しました"};
+  // 復元前に、現在のデータを保護するためバックアップを取る
+  try{ await storageSet(BACKUP_STORAGE_KEY, JSON.stringify(state)); } catch(e){ /* バックアップ失敗は復元自体は続行する */ }
+  state = parsed;
+  migrateState(); // saveDataVersionの確認・不足フィールドの補完(必要なマイグレーション)
+  await saveState();
+  return {ok:true, msg:"セーブデータを復元しました"};
+}
+// セーブデータを削除して新規ゲームを開始する(削除前に自動バックアップを作成する)
+async function deleteSaveDataAndRestart(){
+  try{ await storageSet(BACKUP_STORAGE_KEY, JSON.stringify(state)); } catch(e){ /* バックアップ失敗しても削除は続行する */ }
+  await storageDelete(currentStorageKey());
+  state = initState();
+  migrateState();
+  await saveState();
+  render();
+  startGameLoop();
+  closeModal();
+  toast("セーブデータを削除し、新しいゲームを開始しました(削除前のデータはバックアップに保存されています)");
+  openTutorial();
+}
+
 function openDebugPanel(){ showModal(); renderDebugPanel(); }
 function renderDebugPanel(){
   const modal = document.getElementById('modal');
@@ -5943,6 +6664,12 @@ function renderDebugPanel(){
       <button class="btn btn-red btn-block btn-sm" id="btn-dbg-force-delist">選択中の銘柄を強制上場廃止</button>
     </div>
 
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>株主構成データ整合性チェック</h2></div>
+    <div style="padding:10px 0;">
+      <button class="btn btn-ghost btn-block btn-sm" id="btn-dbg-consistency-check">整合性チェックを実行</button>
+      <div id="dbg-consistency-result" style="margin-top:10px; font-size:10.5px; font-family:var(--font-wide); line-height:1.7;"></div>
+    </div>
+
     <div style="height:10px;"></div>
     <button class="btn btn-ghost btn-block" id="btn-disable-debug">デバッグモードを終了(通常モードに戻る)</button>
   `;
@@ -5969,6 +6696,18 @@ function renderDebugPanel(){
     const r = debugForceDelist(stockId);
     toast(r.msg); render(); renderDebugPanel();
   };
+  modal.querySelector('#btn-dbg-consistency-check').onclick = ()=>{
+    const issues = runShareholderConsistencyCheck();
+    const resultEl = modal.querySelector('#dbg-consistency-result');
+    if(!issues.length){
+      resultEl.innerHTML = `<div style="color:var(--green); font-weight:800;">株主構成データ整合性チェック:PASS</div>`;
+    } else {
+      resultEl.innerHTML = `<div style="color:var(--red); font-weight:800; margin-bottom:6px;">株主構成データ不整合:${issues.length}件</div>` +
+        issues.map(i=>`<div style="margin-bottom:6px; padding:6px; background:var(--panel-alt); border:1px solid var(--line);">
+          <div>項目:${i.item}</div><div>銘柄:${i.stock}</div><div>期待値:${i.expected}</div><div>実際値:${i.actual}</div><div>計算式:${i.formula}</div>
+        </div>`).join("");
+    }
+  };
   modal.querySelector('#btn-disable-debug').onclick = disableDebugMode;
 }
 document.getElementById('btn-debug-menu').addEventListener('click', openDebugPanel);
@@ -5977,16 +6716,33 @@ document.getElementById('btn-debug-menu').addEventListener('click', openDebugPan
    12. 初期化
    ========================================================================== */
 async function boot(){
-  const loaded = await loadState();
-  state = loaded || initState();
+  const result = await loadState();
+  if(result.ok){
+    state = result.data;
+    if(result.restoredFromBackup){
+      setTimeout(()=>toast("メインのセーブデータが読み込めなかったため、直近のバックアップから復元しました"), 800);
+    }
+  } else if(result.hadRawData){
+    // データは存在したが、メイン・バックアップともに検証に失敗した場合のみユーザーに通知する(いきなり初期化しない)
+    state = initState();
+    setTimeout(()=>{
+      alert("セーブデータの読み込みに失敗しました。データが破損している可能性があります。\n新しいゲームとして開始しますが、元のデータはストレージ上に残っている場合があります。");
+    }, 800);
+  } else {
+    // 本当に初回起動(セーブデータが存在しない)
+    state = initState();
+  }
   migrateState();
   render();
   startGameLoop();
+  startPeriodicAutosave();
   if(needsPlayerName()) openPlayerNameModal();
   else if(!state.tutorialSeen) openTutorial();
 }
 // 読み込んだセーブデータに不足しているフィールドを補完する(通常モード・デバッグモード共通で利用)
+// 既存の値は一切上書きしない。「存在しない項目にだけデフォルト値を設定する」方式を徹底する。
 function migrateState(){
+  runSaveVersionMigrations();
   if(state.playerName===undefined) state.playerName="";
   if(state.investCompanyName===undefined) state.investCompanyName = state.companyFounded ? `${state.playerName||"プレイヤー"}キャピタル` : null;
   if(state.brokerage && state.brokerage.unlocked && !state.brokerage.name) state.brokerage.name = `${state.playerName||"プレイヤー"}証券`;
@@ -6026,6 +6782,7 @@ function migrateState(){
   if(state.ipoJustAnnounced===undefined) state.ipoJustAnnounced=false;
   if(!state.ventures) state.ventures=[];
   if(!state.rivals || !state.rivals.length) state.rivals=generateRivals();
+  if(state.activeTob===undefined) state.activeTob=null;
   if(!state.globalCompanies || !state.globalCompanies.length) state.globalCompanies=generateGlobalCompanies();
   if(!state.legendaryFeats) state.legendaryFeats={tenbagger:false, oku100:false, oku1000:false, ipoSuccess:false, worldClassCompany:false, marketDominator:false};
   if(!state.pendingCelebrations) state.pendingCelebrations=[];
@@ -6083,6 +6840,9 @@ function migrateState(){
     if(st.floatRatio===undefined) st.floatRatio=rand(0.35,0.75);
     if(st.playerNetDemand===undefined) st.playerNetDemand=0;
     if(st.moodDrift===undefined) st.moodDrift=0;
+    if(!st.shareholders) st.shareholders = null; // 初回アクセス時に生成される
+    if(st.marginBuyOutstanding===undefined) st.marginBuyOutstanding = Math.round(st.shares*0.01);
+    if(st.marginSellOutstanding===undefined) st.marginSellOutstanding = Math.round(st.shares*0.005);
     if(!st.boardPosts) st.boardPosts=[];
   });
 }
