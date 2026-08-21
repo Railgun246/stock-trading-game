@@ -519,38 +519,99 @@ function adjustShareholderRegistryForCapitalEvent(st, type, amount){
 /* ==========================================================================
    投資家掲示板・市場センチメント(銘柄ごとの「市場の声」)
    ========================================================================== */
-const BOARD_PERSONAS = ["個人投資家","デイトレーダー","長期投資家","成長株投資家","バリュー投資家","海外投資家","機関投資家","ヘッジファンド","アナリスト"];
+// 投稿者の個性(強気寄り/弱気寄り/中立のバイアスを持つ)
+const BOARD_PERSONAS = [
+  {name:"長期投資家",     bias:0.15,  style:"fundamental"},
+  {name:"デイトレーダー", bias:0,     style:"technical"},
+  {name:"スイングトレーダー", bias:0,  style:"technical"},
+  {name:"初心者",         bias:0.1,   style:"casual"},
+  {name:"機関投資家目線", bias:0.05,  style:"institutional"},
+  {name:"テクニカル派",   bias:0,     style:"technical"},
+  {name:"ファンダメンタル派", bias:0.1, style:"fundamental"},
+  {name:"配当重視派",     bias:0.05,  style:"dividend"},
+  {name:"成長株好き",     bias:0.2,   style:"growth"},
+  {name:"空売り派",       bias:-0.25, style:"bear"},
+  {name:"信者",           bias:0.4,   style:"believer"},
+  {name:"アンチ",         bias:-0.4,  style:"anti"},
+  {name:"様子見勢",       bias:0,     style:"neutral"},
+  {name:"海外投資家",     bias:0.05,  style:"foreign"},
+  {name:"個人投資家",     bias:0,     style:"casual"},
+];
+// 通常時の投稿(2〜4行程度、賛否両論)
 const BOARD_POST_TEMPLATES = {
   bullish: [
-    ()=>"決算を見る限りまだ割安だと思う",
-    ()=>"次の決算で上方修正がありそう",
-    ()=>"このテーマは今後かなり伸びると思う",
-    ()=>"機関投資家の買いが増えている",
-    ()=>"成長率が業界平均を上回っている、注目",
-    ()=>"押し目は拾い場だと思う",
-    ()=>"長期で持てば報われる銘柄だと思う",
-    ()=>"海外投資家からの評価も高まっている印象",
-    (st)=>`${st.sector}の中では割安に放置されている`,
-    ()=>"出来高を伴った上昇、地合いが良い",
+    (st)=>`決算を見る限りまだ割安だと思う。\n売上だけじゃなく利益率も改善してるし、\nこの成長が続くなら今の株価は妥当な水準じゃない？`,
+    (st)=>`成長率が業界平均を大きく上回ってる。\n${st.sector}の中では頭一つ抜けてる印象。\n押し目があれば拾いたい。`,
+    (st)=>`機関投資家の買いが増えている感じがする。\n出来高を伴った上昇は地合いが良い証拠。\nしばらくは強い展開が続きそう。`,
+    (st)=>`このテーマは今後かなり伸びると思う。\n短期的な上げ下げより、\n数年単位で見た時の成長ストーリーに期待してる。`,
+    (st)=>`長期で持てば報われる銘柄だと思う。\n目先の株価に一喜一憂せず、\n業績の推移だけ追っていくつもり。`,
+    (st)=>`海外投資家からの評価も高まっている印象。\n国内よりも海外の方が評価が早い気がする。\n見直し買いが続くと見てる。`,
+    (st)=>`次の決算で上方修正がありそう。\n直近の受注動向を見る限り悪くない。\n発表が楽しみ。`,
+    (st)=>`${st.sector}全体の追い風もあるし、\nこの銘柄は特にその恩恵を受けやすい。\n中期的には強気で見てる。`,
   ],
   bearish: [
-    ()=>"PERが高すぎる",
-    ()=>"さすがに短期間で上がりすぎ",
-    ()=>"業績の割に期待が先行しすぎでは",
-    ()=>"そろそろ利益確定売りが出そう",
-    ()=>"材料出尽くし感がある",
-    ()=>"競合の動向が気になる",
-    ()=>"信用買い残が積み上がっていて重い",
-    (st)=>`${st.sector}全体に逆風が吹いている`,
-    ()=>"高値圏でのもみ合いが続いていて怪しい",
+    (st)=>`さすがに短期間で上がりすぎだと思う。\nPERも高水準まで来てるし、\n利益確定売りが出てもおかしくない局面。`,
+    (st)=>`業績の割に期待が先行しすぎでは。\n決算自体は悪くなかったけど、\nすでに株価に織り込まれてた気がする。`,
+    (st)=>`信用買い残が積み上がっていて重い。\n上値を買い残がふさいでる印象で、\n上がってもすぐ跳ね返される感じがする。`,
+    (st)=>`競合の動向が気になるところ。\n${st.sector}全体の競争が激化していて、\nシェアを維持できるか不透明。`,
+    (st)=>`材料出尽くし感がある。\n好材料が出た直後に下がるパターン、\n何度か見た気がする。`,
+    (st)=>`高値圏でのもみ合いが続いていて怪しい。\n出来高も減ってきてるし、\nそろそろ調整が入ってもおかしくない。`,
+    (st)=>`正直このバリュエーションはやりすぎ。\n成長率を織り込んでも割高感が拭えない。\n一旦様子を見たほうがいいと思う。`,
   ],
   neutral: [
-    ()=>"しばらくはレンジ相場が続きそう",
-    ()=>"次の決算まで様子見かな",
-    ()=>"方向感がなくて判断が難しい",
-    ()=>"材料待ちの展開",
-    (st)=>`${st.sector}全体の動きに連動している印象`,
-    ()=>"出来高が細っていて動きにくい",
+    (st)=>`しばらくはレンジ相場が続きそう。\n次の決算まで方向感が出にくい気がする。\n無理に動かず待つのもアリかも。`,
+    (st)=>`決算自体は悪くないけど、\n次の四半期を見てから判断したいかな。\n今はまだ様子見。`,
+    (st)=>`${st.sector}全体の動きに連動している印象。\n個別の材料というより、\nセクター全体の流れを見た方が良さそう。`,
+    (st)=>`出来高が細っていて動きにくい。\n方向感がなくて判断が難しい局面。\n無理にポジションは取らない。`,
+    (st)=>`強気派も弱気派もいるみたいだけど、\n自分はまだどちらとも言えないかな。\nもう少し情報を集めてから考える。`,
+  ],
+};
+// ニュース速報直後(当日)の反応。短く、感情がストレートに出やすい
+const NEWS_REACTION_IMMEDIATE = {
+  bull: [
+    ()=>`速報きた!これは好material。\n数字を細かく見てみる。`,
+    ()=>`おっ、これは良さそうな内容。\n寄り付きの反応が楽しみ。`,
+    ()=>`思ったより良い内容で驚いた。\n素直に評価していいと思う。`,
+  ],
+  bear: [
+    ()=>`うーん、この内容は微妙かも。\n反応が気になるところ。`,
+    ()=>`ちょっと期待外れの内容だった。\n明日の寄り付きが心配。`,
+    ()=>`これは織り込み済みだと思ってたけど、\n意外と反応しそうな内容。`,
+  ],
+  neutral: [
+    ()=>`速報出たな。まずは内容を確認中。`,
+    ()=>`これはすぐには判断できない内容。\nもう少し詳細を待ちたい。`,
+  ],
+};
+// 発表の翌営業日、より踏み込んだ分析・議論の反応
+const NEWS_REACTION_NEXTDAY = {
+  bull: [
+    (st)=>`昨日のニュースを踏まえて改めて見ると、\n${st.sector}の中でも評価が上がりそうな内容だった。\n買い増しを検討中。`,
+    (st)=>`冷静に数字を見返してみたけど、\nやっぱり悪くない内容だと思う。\nこの調子なら来期も期待できそう。`,
+    ()=>`昨日の下げは行き過ぎだったと思う。\n内容自体は前向きに評価できる。\n押し目は拾い場かもしれない。`,
+  ],
+  bear: [
+    (st)=>`昨日は盛り上がってたけど、\n冷静になって数字を見ると割と普通の内容。\n過度な期待は禁物だと思う。`,
+    ()=>`一晩明けて考えたけど、\nやっぱり材料としては弱いと思う。\n短期的な上げは続かなそう。`,
+    ()=>`昨日の急騰、正直やりすぎだと思ってた。\n案の定、今日は反落してるし、\n高値掴みには注意した方がいい。`,
+  ],
+  neutral: [
+    ()=>`ニュースの内容を色々な人が議論してるけど、\n意見が分かれてて面白い。\n自分はもう少し様子を見る。`,
+    (st)=>`${st.sector}の他銘柄の反応も見てから\n判断したいところ。\n個別で動くのか業界全体なのか気になる。`,
+  ],
+};
+// さらに数日後、結果論としての振り返り
+const NEWS_REACTION_HINDSIGHT = {
+  bull: [
+    ()=>`結局あのニュースは正しく評価されたな。\n買っておいて良かったと思う。\n続報にも期待。`,
+    ()=>`振り返ると、あの時が押し目だったな。\n今から見ればいいエントリーだった。`,
+  ],
+  bear: [
+    ()=>`結局あの時の材料は一時的なものだったな。\n株価も元の水準に戻りつつある。\n次の材料待ち。`,
+    ()=>`寄り天だったなあの日。\n飛び乗った人は含み損抱えてそう。\n焦らず次のチャンスを待つ。`,
+  ],
+  neutral: [
+    ()=>`結局あのニュースの影響は\n一時的なものだったみたい。\n次の材料まではレンジかな。`,
   ],
 };
 // 銘柄ごとの市場心理スコア(ファンダメンタルズ・直近の値動き・緩やかに漂うムードから算出)
@@ -571,13 +632,16 @@ function sentimentLabel(score){
   if(score<-0.12) return "やや弱気";
   return "中立";
 }
+function pickBoardCategory(sentimentScore, persona){
+  const personalBias = sentimentScore + (persona.bias||0) + rand(-0.4,0.4);
+  return personalBias>0.15 ? "bullish" : (personalBias<-0.15 ? "bearish" : "neutral");
+}
 function generateBoardPost(st){
   const sentimentScore = computeStockSentiment(st);
   const persona = pick(BOARD_PERSONAS);
-  const personalBias = sentimentScore + rand(-0.5,0.5);
-  const category = personalBias>0.15 ? "bullish" : (personalBias<-0.15 ? "bearish" : "neutral");
+  const category = pickBoardCategory(sentimentScore, persona);
   const text = pick(BOARD_POST_TEMPLATES[category])(st);
-  return {persona, text, category, day: state.day};
+  return {persona: persona.name, text, category, day: state.day};
 }
 function ensureBoardPosts(st){
   if(!st.boardPosts) st.boardPosts=[];
@@ -590,7 +654,51 @@ function updateMarketSentiment(){
     st.moodDrift = clamp((st.moodDrift||0) + rand(-0.03,0.03), -0.4, 0.4);
     if(!st.boardPosts) st.boardPosts=[];
     st.boardPosts.unshift(generateBoardPost(st));
-    if(st.boardPosts.length>30) st.boardPosts.pop();
+    if(st.boardPosts.length>60) st.boardPosts.pop();
+  });
+  // ニュースをきっかけに時間差で反応するキューを処理する(速報→翌日の分析→数日後の振り返り)
+  processQueuedNewsReactions();
+}
+// 重要なニュース発生時に、掲示板へ大量の投稿(賛否両論+時間差反応)を流し込む
+function triggerNewsBoardBurst(st, isPositive, stars){
+  if(!st.boardPosts) st.boardPosts=[];
+  const burstSize = stars>=5 ? randInt(18,30) : (stars>=4 ? randInt(10,18) : randInt(4,8));
+  const bullRatio = isPositive ? 0.62 : 0.28; // 好材料でも懐疑派は残り、悪材料でも押し目狙いの強気派はいる
+  for(let i=0;i<burstSize;i++){
+    const persona = pick(BOARD_PERSONAS);
+    const roll = Math.random();
+    const category = roll<bullRatio ? "bull" : (roll<bullRatio+0.25 ? "neutral" : "bear");
+    const bucket = category==="bull" ? NEWS_REACTION_IMMEDIATE.bull : (category==="bear" ? NEWS_REACTION_IMMEDIATE.bear : NEWS_REACTION_IMMEDIATE.neutral);
+    const text = pick(bucket)(st);
+    st.boardPosts.unshift({persona: persona.name, text, category: category==="bull"?"bullish":(category==="bear"?"bearish":"neutral"), day: state.day});
+  }
+  if(st.boardPosts.length>60) st.boardPosts.length = 60;
+  // 翌日・数日後の時間差反応をキューに登録しておく
+  state.pendingBoardReactions = state.pendingBoardReactions || [];
+  state.pendingBoardReactions.push({stockId:st.id, isPositive, dueDay: state.day+1, wave:"nextday"});
+  state.pendingBoardReactions.push({stockId:st.id, isPositive, dueDay: state.day+randInt(2,4), wave:"hindsight"});
+}
+function processQueuedNewsReactions(){
+  if(!state.pendingBoardReactions || !state.pendingBoardReactions.length) return;
+  const due = state.pendingBoardReactions.filter(r=>state.day>=r.dueDay);
+  if(!due.length) return;
+  state.pendingBoardReactions = state.pendingBoardReactions.filter(r=>state.day<r.dueDay);
+  due.forEach(r=>{
+    const st = state.stocks.find(s=>s.id===r.stockId);
+    if(!st) return;
+    if(!st.boardPosts) st.boardPosts=[];
+    const templates = r.wave==="nextday" ? NEWS_REACTION_NEXTDAY : NEWS_REACTION_HINDSIGHT;
+    const count = randInt(3,7);
+    for(let i=0;i<count;i++){
+      const persona = pick(BOARD_PERSONAS);
+      const roll = Math.random();
+      const bullRatio = r.isPositive ? 0.55 : 0.3;
+      const category = roll<bullRatio ? "bull" : (roll<bullRatio+0.25 ? "neutral" : "bear");
+      const bucket = templates[category] || templates.neutral;
+      const text = pick(bucket)(st);
+      st.boardPosts.unshift({persona: persona.name, text, category: category==="bull"?"bullish":(category==="bear"?"bearish":"neutral"), day: state.day});
+    }
+    if(st.boardPosts.length>60) st.boardPosts.length = 60;
   });
 }
 
@@ -1002,6 +1110,7 @@ function initState(){
     ventures:[], acquisitionsUnlockNotified:false,
     rivals: generateRivals(),
     activeTob: null,
+    pendingBoardReactions: [],
     globalCompanies: generateGlobalCompanies(),
     legendaryFeats:{tenbagger:false, oku100:false, oku1000:false, ipoSuccess:false, worldClassCompany:false, marketDominator:false},
     pendingCelebrations:[],
@@ -1929,14 +2038,19 @@ function resolveEarnings(st){
   const growthTarget = 6;
   const meanReversionForce = (st.growth - growthTarget) * -0.035;
   st.growth = clamp(st.growth + rand(-1.2,1.2) + meanReversionForce, -8, 45);
-  st.quality = clamp(st.quality + rand(-0.015,0.015), 0.05, 0.95);
+  // 企業の「地力」も、極端な優位性が永続しないよう非常に緩やかに平均へ回帰する
+  // (一時的な絶好調が過ぎれば、競合の追い上げや市場の成熟によって強みは徐々に希薄化するという現実の力学を表す)
+  const qualityTarget = 0.60;
+  const qualityReversion = (st.quality - qualityTarget) * -0.01;
+  st.quality = clamp(st.quality + rand(-0.015,0.015) + qualityReversion, 0.05, 0.95);
 
   // 大化け企業の芽(隠しフラグ): 好決算が続くほど地力と成長率がじわじわ加速する(平均回帰に抗う、ごく低確率の例外)
-  // ただし超高成長がずっと続くことは現実的でないため、上場から一定期間(約10年)でこのブーストは終了し、
+  // ただし、質が高くなるほど「好決算が出やすくなる→さらに質が上がる」という際限のない自己強化ループに陥らないよう、
+  // 上限に近づくほど伸び幅が小さくなる(逓減する)ようにする。成長ブースト自体も、上場から約5年で終了し、
   // その後は他の企業と同じ速度で成熟(平均回帰)していく
-  if(st.moonshotPotential && (state.day - (st.listedDay||1)) < 3650){
-    st.quality = clamp(st.quality + 0.012, 0, 0.97);
-    if(pct>0) st.growth = clamp(st.growth + rand(0.6,2.8), -8, 45);
+  if(st.moonshotPotential && (state.day - (st.listedDay||1)) < 1825){
+    st.quality = clamp(st.quality + 0.012*(1-st.quality), 0, 0.9);
+    if(pct>0 && Math.random()<0.6) st.growth = clamp(st.growth + rand(0.4,1.8), -8, 35);
   }
 
   if(!st.earningsLog) st.earningsLog=[];
@@ -1988,7 +2102,7 @@ function buildMaterialNewsEvent(){
   return {stockId:st.id, impactPct:mag, text:def.text(st.name), stars:def.stars, type:def.good?"good":"event", label:def.type};
 }
 // 資金調達イベント: 新株発行(希薄化)・株式分割(流動性向上)・自社株買い(EPS改善)による構造変化
-function applyCapitalStructureEvent(st, type){
+function applyCapitalStructureEvent(st, type, explicitSplitRatio){
   if(state.activeTob && state.activeTob.stockId===st.id && !state.activeTob.resolved) return; // TOB進行中は株式数を変動させない(整合性を保つため)
   ensureShareholderRegistry(st);
   if(type==="増資"){
@@ -1997,7 +2111,7 @@ function applyCapitalStructureEvent(st, type){
     st.shares += newShares; // 発行済株式数の増加→EPS低下・持ち株比率低下として以降の計算に自然に反映される
     adjustShareholderRegistryForCapitalEvent(st, "増資", newShares);
   } else if(type==="株式分割"){
-    const splitRatio = pick([2,3]);
+    const splitRatio = explicitSplitRatio || pick([2,3]);
     st.shares *= splitRatio;
     st.price = st.price/splitRatio;
     st.prevPrice = st.prevPrice/splitRatio;
@@ -2013,6 +2127,18 @@ function applyCapitalStructureEvent(st, type){
     adjustShareholderRegistryForCapitalEvent(st, "自社株買い", retiredShares);
   }
   reconcileShareholderRegistry(st);
+}
+// 株価が高くなりすぎた場合、企業価値(プレイヤーの資産価値)を一切変えずに株式分割で単価を適正化する。
+// 「強制的に下げる」のではなく、経営判断的な間隔でゆるやかに実施する(閾値超えの日すべてで即座には発動しない)
+function checkAutoStockSplit(st){
+  const threshold = 50000;
+  if(st.price < threshold) return;
+  if(state.activeTob && state.activeTob.stockId===st.id && !state.activeTob.resolved) return;
+  if(Math.random() >= 0.025) return;
+  const splitRatio = st.price >= 200000 ? 5 : (st.price >= 100000 ? 3 : 2);
+  const before = st.price;
+  applyCapitalStructureEvent(st, "株式分割", splitRatio);
+  pushNews(`${st.name}が1:${splitRatio}の株式分割を実施した(¥${fmtNum(before)}→¥${fmtNum(st.price)})。投資家がより購入しやすい水準に単価が調整された。`, {stars:3, kind:"confirmed", category:"venture", stockId:st.id, type:"good"});
 }
 
 /* ==========================================================================
@@ -3117,15 +3243,62 @@ function resolveBoardDecision(decisionId, choice){
 // 株主総会(年1回、配当政策を決定する。上場後も継続開催)
 function holdShareholderMeeting(v){
   const t = ventureTarget(v);
-  if(t.profit>0){
-    const dividend = Math.max(0, Math.round(t.profit*0.15*v.stake));
+  const payoutRatio = v.dividendPayoutRatio!==undefined ? v.dividendPayoutRatio : 0.15;
+  if(t.profit>0 && payoutRatio>0){
+    const dividend = Math.max(0, Math.round(t.profit*payoutRatio*v.stake));
     state.cash += dividend;
     state.stats.totalDividends = (state.stats.totalDividends||0)+dividend;
     pushNews(`${v.name}の株主総会が開催され、配当${fmtYen(dividend)}を受け取った。`, {stars:2, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+    // 配当を出しすぎると企業の現金が減り、将来の成長力(投資余力)が低下するトレードオフを表現する
+    if(payoutRatio>0.35) v.cashBalance = Math.max(0, (v.cashBalance||0) - Math.round(t.profit*(payoutRatio-0.35)*0.5));
   } else {
     pushNews(`${v.name}の株主総会が開催されたが、今期は無配となった。`, {stars:1, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"flavor"});
   }
   v.lastShareholderMeetingDay = state.day;
+}
+// 配当方針の設定(配当性向0〜60%)。出しすぎると将来の成長投資余力とのトレードオフが生じる
+function ventureSetDividendPolicy(ventureId, payoutRatio){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v || v.stage!=="listed") return {ok:false, msg:"上場企業のみ配当方針を設定できます"};
+  v.dividendPayoutRatio = clamp(payoutRatio, 0, 0.6);
+  saveState();
+  return {ok:true, msg:`配当性向を${Math.round(v.dividendPayoutRatio*100)}%に設定しました`};
+}
+// 自社株買い(プレイヤーが経営する上場企業向け)。市場流通株式が減りEPSは改善するが、反応は業績・市場環境次第で変わる
+function ventureExecuteBuyback(ventureId, amount){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v || v.stage!=="listed") return {ok:false, msg:"上場企業のみ自社株買いを実施できます"};
+  const st = ventureTarget(v);
+  if(!st) return {ok:false, msg:"対象銘柄が見つかりません"};
+  if((v.cashBalance||0) < amount) return {ok:false, msg:"企業の現金が不足しています"};
+  const sharesRetired = Math.min(Math.floor(amount/st.price/100)*100, st.shares-100000);
+  if(sharesRetired<=0) return {ok:false, msg:"買い戻せる株数がありません"};
+  v.cashBalance -= amount;
+  st.shares -= sharesRetired;
+  adjustShareholderRegistryForCapitalEvent(st, "自社株買い", sharesRetired);
+  reconcileShareholderRegistry(st);
+  const positiveReaction = Math.random() < clamp(0.4+st.quality*0.3, 0.2, 0.8);
+  if(positiveReaction) pushNews(`${v.name}が自社株買いを発表した。EPS改善が期待されている。`, {stars:3, kind:"confirmed", category:"venture", stockId:st.id, type:"good"});
+  else pushNews(`${v.name}が自社株買いを発表したが、市場の反応は限定的だった。`, {stars:2, kind:"confirmed", category:"venture", stockId:st.id, type:"flavor"});
+  saveState();
+  return {ok:true, msg:`自社株買いを実施しました(${fmtNum(sharesRetired)}株)`};
+}
+// 新株発行による資金調達(プレイヤーが経営する上場企業向け)。資金は得られるが既存株主(プレイヤー含む)の持分比率は希薄化する
+function ventureIssueNewShares(ventureId, amount){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v || v.stage!=="listed") return {ok:false, msg:"上場企業のみ新株発行による資金調達を実施できます"};
+  const st = ventureTarget(v);
+  if(!st) return {ok:false, msg:"対象銘柄が見つかりません"};
+  const newShares = Math.max(TRADING_UNIT, Math.round(amount/st.price/100)*100);
+  const sharesBefore = st.shares;
+  st.shares += newShares;
+  adjustShareholderRegistryForCapitalEvent(st, "増資", newShares);
+  reconcileShareholderRegistry(st);
+  v.cashBalance = (v.cashBalance||0) + amount;
+  v.stake = v.stake * sharesBefore/st.shares; // プレイヤーの持分比率も他の株主同様に希薄化する
+  pushNews(`${v.name}が新株発行により${fmtYen(amount)}の資金調達を実施した。発行済株式数が増加し、既存株主の持分比率は希薄化した。`, {stars:4, kind:"confirmed", category:"venture", stockId:st.id, type:"event"});
+  saveState();
+  return {ok:true, msg:`新株発行により${fmtYen(amount)}を調達しました(持分比率${(v.stake*100).toFixed(1)}%に希薄化)`};
 }
 
 // 低確率の特別イベント(上場後も継続して発生する)
@@ -3205,8 +3378,116 @@ function applyGroupSynergy(parent){
     }
   });
 }
+/* ==========================================================================
+   第三者による自社(プレイヤーが経営する上場企業)への買収提案・敵対的TOB
+   ========================================================================== */
+const RIVAL_ACQUIRER_NAMES = ["グローバル・ホールディングス","日本電子工業","太陽グループ","フェニックス・キャピタル","北斗インベストメンツ","青山コーポレーション"];
+function checkIncomingTakeoverOffer(){
+  const candidates = state.ventures.filter(v=>v.stage==="listed" && !v.incomingOffer && !v.incomingHostileTob);
+  if(!candidates.length) return;
+  if(Math.random()>=0.0004) return; // ごく低確率
+  const v = pick(candidates);
+  const st = ventureTarget(v);
+  if(!st) return;
+  const premiumPct = rand(0.15,0.45);
+  const offerPrice = Math.round(st.price*(1+premiumPct));
+  const acquirer = pick(RIVAL_ACQUIRER_NAMES);
+  v.incomingOffer = {acquirer, offerPrice, premiumPct, day: state.day, deadline: state.day+15};
+  pushNews(`【買収提案】${acquirer}が${v.name}へTOBを提案した。買付価格¥${fmtNum(offerPrice)}(プレミアム${Math.round(premiumPct*100)}%)。`, {stars:5, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+}
+function respondToIncomingOffer(ventureId, accept){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v || !v.incomingOffer) return {ok:false, msg:"対象の提案が見つかりません"};
+  const offer = v.incomingOffer;
+  const st = ventureTarget(v);
+  if(accept){
+    const payout = Math.round(offer.offerPrice * (st?st.shares:0) * v.stake);
+    state.cash += payout;
+    pushNews(`${v.name}は${offer.acquirer}によるTOBを受け入れ、経営権を譲渡した。`, {stars:5, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+    v.stage = "failed"; v.failureReason = "buyout_accepted";
+    v.incomingOffer = null;
+    queueCelebration("会社売却完了", `${v.name}を${fmtYen(payout)}で売却した。`);
+    saveState();
+    return {ok:true, msg:`売却が完了しました(${fmtYen(payout)}を獲得)`};
+  } else {
+    pushNews(`${v.name}の経営陣は${offer.acquirer}によるTOB提案を拒否した。`, {stars:4, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+    if(Math.random()<0.5){
+      v.incomingHostileTob = {acquirer:offer.acquirer, price:offer.offerPrice, startDay:state.day, endDay:state.day+14, resolved:false, defenseUsed:null};
+      pushNews(`【敵対的TOB】${offer.acquirer}が${v.name}に対する敵対的TOBを開始した。防衛策を検討する必要がある。`, {stars:5, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+    }
+    v.incomingOffer = null;
+    saveState();
+    return {ok:true, msg:"提案を拒否しました"};
+  }
+}
+const INCOMING_TOB_DEFENSES = {
+  newshares: {label:"新株発行", desc:"希薄化により買収コストを引き上げるが、自社の持分比率も下がる"},
+  buyback:   {label:"自社株買い", desc:"流通株式を減らし取得を難しくするが、企業の現金を消費する"},
+  whiteknight:{label:"ホワイトナイトを探す", desc:"友好的な救済者が現れる可能性があるが、必ず見つかるとは限らない"},
+  dividend:  {label:"配当増額で株主に訴える", desc:"株主の支持を得やすくなるが、将来の成長投資余力が下がる"},
+  explain:   {label:"株主への説明を強化する", desc:"ブランド・信頼を高めるが、即効性は低い"},
+};
+function defendAgainstIncomingTob(ventureId, defenseKey){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v || !v.incomingHostileTob || v.incomingHostileTob.resolved) return {ok:false, msg:"対象の敵対的TOBが見つかりません"};
+  const tob = v.incomingHostileTob;
+  if(tob.defenseUsed) return {ok:false, msg:"すでに防衛策を実施済みです"};
+  const st = ventureTarget(v);
+  if(defenseKey==="newshares"){
+    if(!st) return {ok:false, msg:"対象銘柄が見つかりません"};
+    ventureIssueNewShares(v.id, Math.round(st.price*st.shares*0.15));
+    tob.defenseUsed = "第三者割当増資";
+  } else if(defenseKey==="buyback"){
+    const amount = Math.min(v.cashBalance||0, st?Math.round(st.price*st.shares*0.05):0);
+    if(amount<=0) return {ok:false, msg:"自社株買いを実施する現金がありません"};
+    ventureExecuteBuyback(v.id, amount);
+    tob.defenseUsed = "自社株買い";
+  } else if(defenseKey==="whiteknight"){
+    if(Math.random()<0.4){
+      tob.defenseUsed = "ホワイトナイト";
+      pushNews(`${v.name}にホワイトナイトが現れた。買収防衛への協力が期待できる。`, {stars:4, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+    } else {
+      tob.defenseUsed = "ホワイトナイト(失敗)";
+      pushNews(`${v.name}はホワイトナイトを探したが、見つからなかった。`, {stars:3, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+    }
+  } else if(defenseKey==="dividend"){
+    if(v.stage==="listed") ventureSetDividendPolicy(v.id, 0.5);
+    tob.defenseUsed = "配当増額";
+  } else if(defenseKey==="explain"){
+    v.brand = clamp((v.brand||30)+10, 0, 100);
+    tob.defenseUsed = "株主への説明";
+  } else {
+    return {ok:false, msg:"不正な防衛策です"};
+  }
+  saveState();
+  return {ok:true, msg:`防衛策(${tob.defenseUsed})を実施しました`};
+}
+function resolveIncomingHostileTob(v){
+  const tob = v.incomingHostileTob;
+  if(!tob || tob.resolved) return;
+  tob.resolved = true;
+  const difficulty = 0.3 + (v.stake>0.5?0.3:0) + (tob.defenseUsed && !tob.defenseUsed.includes("失敗") ?0.2:0);
+  const successProb = clamp(0.5 - difficulty, 0.05, 0.85); // 買収側(第三者)の成功確率
+  const success = Math.random() < successProb;
+  const st = ventureTarget(v);
+  if(success){
+    const payout = Math.round(tob.price * (st?st.shares:0) * v.stake);
+    state.cash += payout;
+    pushNews(`【TOB成立】${tob.acquirer}が${v.name}の経営権を取得した。保有株式は買付価格で売却された。`, {stars:5, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+    v.stage = "failed"; v.failureReason = "hostile_taken";
+  } else {
+    pushNews(`【TOB失敗】${v.name}は${tob.acquirer}のTOBを退けた。独立経営を維持している。`, {stars:5, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+    queueCelebration("買収防衛成功", `${v.name}は${tob.acquirer}の敵対的TOBを退けた。`);
+  }
+  v.incomingHostileTob = null;
+}
+
 function updateVentures(){
+  checkIncomingTakeoverOffer();
   state.ventures.forEach(v=>{
+    if(v.incomingHostileTob && !v.incomingHostileTob.resolved && state.day>=v.incomingHostileTob.endDay){
+      resolveIncomingHostileTob(v);
+    }
     if(v.stage!=="private" && v.stage!=="listed") return;
     updateProductPipeline(v);
     checkFundraisingNeed(v);
@@ -3696,6 +3977,9 @@ function advanceDay(){
     st.prevPrice = dayOpen;
     st.price = dayClose;
 
+    // 株価が高くなりすぎた場合、企業価値(=保有者の資産価値)を維持したまま株式分割を行い、単価を適正化する
+    checkAutoStockSplit(st);
+
     // 信用建玉(買い残・売り残)を実際の値動きに応じて更新する(画面表示のたびのランダム生成ではなく、日々推移する実データ)
     {
       const chg = (dayClose-dayOpen)/dayOpen;
@@ -3725,14 +4009,18 @@ function advanceDay(){
 
     if(earningsFired) pushNews(`【決算発表】${st.name}:${earningsFired.label}(${fmtPct(earningsFired.pct*100)})`, {stars:earningsFired.stars, kind:"confirmed", category:"earnings", stockId:st.id, type: earningsFired.pct>0.01?"good":(earningsFired.pct<-0.01?"event":"flavor"), impactPct:earningsFired.pct});
     if(earningsFired) pushDisclosure(st, {label:"決算", text:`${st.name}:${earningsFired.label}(営業損益${fmtPct(earningsFired.pct*100)})`, impactPct:earningsFired.pct, type: earningsFired.pct>0.01?"good":(earningsFired.pct<-0.01?"event":"flavor"), stars:earningsFired.stars, internalCategory:"earnings"});
+    if(earningsFired && earningsFired.stars>=3) triggerNewsBoardBurst(st, earningsFired.pct>0, earningsFired.stars);
     if(rumorResolved){
       if(rumorResolved.ok) pushNews(`【確定情報】${st.name}、噂通りの${rumor.direction==="up"?"好材料":"悪材料"}が正式発表(${fmtPct(rumorResolved.magPct*100)})`, {stars:5, kind:"confirmed", category:"rumor-resolution", stockId:st.id, type: rumor.direction==="up"?"good":"event", impactPct:rumorResolved.magPct});
       else pushNews(`【真相判明】${st.name}に関する噂は事実無根だった`, {stars:2, kind:"confirmed", category:"rumor-resolution", stockId:st.id, type:"flavor"});
       state.pendingRumors = state.pendingRumors.filter(r=>r.id!==rumor.id);
+      if(rumorResolved.ok) triggerNewsBoardBurst(st, rumor.direction==="up", 5);
     }
     techNews.forEach(t=>pushNews(t.text, t.opts));
     if(stopHigh) pushNews(`【ストップ高】${st.name}が値幅制限いっぱいまで買われる${st.stopStreak>1?`(${st.stopStreak}日連続)`:""}`, {stars:4, kind:"confirmed", category:"stop", stockId:st.id, type:"good"});
     if(stopLow) pushNews(`【ストップ安】${st.name}が値幅制限いっぱいまで売られる${st.stopStreak<-1?`(${-st.stopStreak}日連続)`:""}`, {stars:4, kind:"confirmed", category:"stop", stockId:st.id, type:"event"});
+    if(stopHigh) triggerNewsBoardBurst(st, true, 4);
+    if(stopLow) triggerNewsBoardBurst(st, false, 4);
 
     processPendingOrders(st);
 
@@ -3745,6 +4033,7 @@ function advanceDay(){
     pushNews(materialEvent.text, {stars:materialEvent.stars, kind:"confirmed", category:"material", stockId:materialEvent.stockId, type:materialEvent.type, impactPct:materialEvent.impactPct});
     const matStock = state.stocks.find(s=>s.id===materialEvent.stockId);
     pushDisclosure(matStock, {label:materialEvent.label, text:materialEvent.text, impactPct:materialEvent.impactPct, type:materialEvent.type, stars:materialEvent.stars, internalCategory:"material"});
+    if(matStock && materialEvent.stars>=3) triggerNewsBoardBurst(matStock, materialEvent.type==="good", materialEvent.stars);
   }
   if(Math.random()<0.07) spawnRumor();
 
@@ -3926,6 +4215,7 @@ let orderFormType = "market";
 let orderFormDrafts = {}; // stockId -> 入力中の注文フォーム下書き(市場データ更新や画面遷移で消えないようにする)
 let ipoApplyDraft = {qty:"100"}; // IPO申込画面の下書き
 let nikkeiTimeframe = "1d"; // 概況画面の日経平均チャートの時間軸(月足/週足/日足)
+let stockChartTimeframe = "1d"; // 銘柄詳細チャートの時間軸(月足/週足/日足)。SMA5/20・ボリンジャーバンドもこの時間軸で再計算する
 let blockModalDismiss = false; // trueの間はモーダルの背景タップやEscでの解除を無効化する(必須入力用)
 
 function el(html){ const d=document.createElement('div'); d.innerHTML=html.trim(); return d.firstElementChild; }
@@ -5013,7 +5303,12 @@ function renderModalSubbody(st){
     });
   },0);
 
-  if(modalSubtab==="chart") setTimeout(()=>drawCandlestickChart(document.getElementById('detail-chart'), st.history, {labels:true, maxCandles:34, showVolume:true, showSMA:true, showBB:document.getElementById('toggle-bb')?document.getElementById('toggle-bb').classList.contains('active'):false, crossLog:st.crossLog}),0);
+  if(modalSubtab==="chart"){
+    document.querySelectorAll('[data-stock-tf]').forEach(b=>{
+      b.onclick = ()=>{ stockChartTimeframe = b.dataset.stockTf; renderModalSubbody(st); };
+    });
+    setTimeout(()=>drawStockDetailChart(st),0);
+  }
   if(modalSubtab==="kaishaho") setTimeout(()=>{
     const hook = document.getElementById('kaishaho-chart-hook');
     if(!hook || !hook.dataset || !hook.dataset.rev || !hook.dataset.prof) return;
@@ -5047,8 +5342,7 @@ function refreshStockModalLive(){
     badgesEl.innerHTML = themeBadge+rumorBadge+stopBadge;
   }
   if(modalSubtab==="chart"){
-    const canvas = document.getElementById('detail-chart');
-    if(canvas) drawCandlestickChart(canvas, st.history, {labels:true, maxCandles:34, showVolume:true, showSMA:true, showBB:document.getElementById('toggle-bb')?document.getElementById('toggle-bb').classList.contains('active'):false, crossLog:st.crossLog});
+    drawStockDetailChart(st);
   }
   refreshOrderFormPreview(st);
 }
@@ -5061,12 +5355,15 @@ function renderModalChartTab(st){
   return `
     <canvas class="chart" id="detail-chart" style="height:170px;"></canvas>
     <div class="toggle-row" style="margin-top:8px;">
-      <button class="btn-toggle" id="toggle-sma">SMA5/20</button>
-      <button class="btn-toggle" id="toggle-bb">ボリンジャー</button>
+      <button class="btn-toggle ${stockChartTimeframe==='1mo'?'active':''}" data-stock-tf="1mo">月足</button>
+      <button class="btn-toggle ${stockChartTimeframe==='1wk'?'active':''}" data-stock-tf="1wk">週足</button>
+      <button class="btn-toggle ${stockChartTimeframe==='1d'?'active':''}" data-stock-tf="1d">日足</button>
     </div>
     <div style="display:flex; gap:10px; margin-top:8px; font-size:9.5px; color:var(--muted); font-family:var(--font-wide); flex-wrap:wrap;">
       <span><i style="display:inline-block; width:8px; height:8px; background:var(--green);"></i> 陽線</span>
       <span><i style="display:inline-block; width:8px; height:8px; background:var(--red);"></i> 陰線</span>
+      <span style="color:var(--cyan);">SMA5/20</span>
+      <span style="color:var(--purple);">ボリンジャーバンド</span>
       ${doubleBottom?'<span class="badge info">ダブルボトム</span>':''}
       ${doubleTop?'<span class="badge warn">ダブルトップ</span>':''}
       ${triangle?'<span class="badge neutral">三角持ち合い</span>':''}
@@ -5082,6 +5379,20 @@ function renderModalChartTab(st){
       <div style="display:flex; flex-wrap:wrap; gap:8px; font-size:10px; color:var(--muted); font-family:var(--font);">${fc.scenarios.map(s=>`<span>${s.label} <b style="color:var(--text);">${s.w}%</b></span>`).join("")}</div>
     </div>
   `;
+}
+// 選択中の時間軸(月足/週足/日足)に応じてローソク足を再構成する。SMA5/20・ボリンジャーバンドは
+// この再構成後のデータから計算されるため、週足なら5週/20週、月足なら5ヶ月/20ヶ月の値になる
+function getStockChartCandles(st){
+  if(stockChartTimeframe==="1mo") return resampleCandles(st.history, 21);
+  if(stockChartTimeframe==="1wk") return resampleCandles(st.history, 5);
+  return st.history;
+}
+function drawStockDetailChart(st){
+  const canvas = document.getElementById('detail-chart');
+  if(!canvas) return;
+  const candles = getStockChartCandles(st);
+  const maxCandles = stockChartTimeframe==="1d" ? 34 : (stockChartTimeframe==="1wk" ? 30 : 24);
+  drawCandlestickChart(canvas, candles, {labels:true, maxCandles, showVolume:stockChartTimeframe==="1d", showSMA:true, showBB:true, crossLog:stockChartTimeframe==="1d"?st.crossLog:[]});
 }
 
 function renderModalKaishahoTab(st){
@@ -5882,6 +6193,36 @@ function renderVentureModal(ventureId){
           <button class="btn btn-cyan btn-block btn-sm" id="btn-view-listed-stock">株価・チャートを見る(銘柄画面へ)</button>
         </div>
       ` : ''}
+      ${v.incomingOffer ? `
+        <div class="sec-body" style="background:rgba(255,59,92,0.06); border:1px solid var(--red); margin-top:8px; padding:12px;">
+          <div style="font-weight:800; color:var(--red); margin-bottom:6px;">【買収提案】${v.incomingOffer.acquirer}</div>
+          <table class="dtable">
+            <tr><td>提示価格</td><td>¥${fmtNum(v.incomingOffer.offerPrice)}</td></tr>
+            <tr><td>プレミアム</td><td>${Math.round(v.incomingOffer.premiumPct*100)}%</td></tr>
+            <tr><td>回答期限</td><td>${v.incomingOffer.deadline-state.day}日以内</td></tr>
+          </table>
+          <div class="buy-sell-row" style="margin-top:8px;">
+            <button class="btn btn-cyan btn-block btn-sm" data-offer-respond="accept">売却する</button>
+            <button class="btn btn-red btn-block btn-sm" data-offer-respond="reject">拒否する</button>
+          </div>
+        </div>
+      ` : ''}
+      ${v.incomingHostileTob && !v.incomingHostileTob.resolved ? `
+        <div class="sec-body" style="background:rgba(255,59,92,0.06); border:1px solid var(--red); margin-top:8px; padding:12px;">
+          <div style="font-weight:800; color:var(--red); margin-bottom:6px;">【敵対的TOB進行中】${v.incomingHostileTob.acquirer}</div>
+          <table class="dtable">
+            <tr><td>買付価格</td><td>¥${fmtNum(v.incomingHostileTob.price)}</td></tr>
+            <tr><td>残り期間</td><td>${v.incomingHostileTob.endDay-state.day}日</td></tr>
+            <tr><td>実施済み防衛策</td><td>${v.incomingHostileTob.defenseUsed||"(未実施)"}</td></tr>
+          </table>
+          ${!v.incomingHostileTob.defenseUsed ? `
+            <div style="font-size:10px; color:var(--muted); margin:8px 0 4px; font-family:var(--font-wide);">防衛策を選択してください(1つのみ実施可能)</div>
+            ${Object.entries(INCOMING_TOB_DEFENSES).map(([key,d])=>`
+              <button class="btn btn-ghost btn-block btn-sm" data-defense="${key}" style="margin-bottom:6px; text-align:left;">${d.label}<br><span style="font-size:9px; color:var(--muted);">${d.desc}</span></button>
+            `).join("")}
+          ` : `<div style="font-size:10.5px; color:var(--muted); font-family:var(--font-wide);">防衛策を実施済みです。結果は期間終了時に判明します。</div>`}
+        </div>
+      ` : ''}
       <div class="grid-2" style="margin-top:8px;">
         <div class="stat-box"><div class="l">売上高</div><div class="v">${fmtYen(kpis.revenue)}</div></div>
         <div class="stat-box"><div class="l">営業利益</div><div class="v ${kpis.operatingProfit>=0?'gain':'loss'}">${fmtYen(kpis.operatingProfit)}</div></div>
@@ -6028,6 +6369,23 @@ function renderVentureModal(ventureId){
   if(ipoBtn) ipoBtn.onclick = ()=>{ const r=attemptVentureIPO(v.id); if(r&&!r.ok) toast(r.msg); renderVentureModal(ventureId); render(); };
   const viewStockBtn = modal.querySelector('#btn-view-listed-stock');
   if(viewStockBtn) viewStockBtn.onclick = ()=>{ openStockModal(v.listedStockId); };
+  modal.querySelectorAll('[data-offer-respond]').forEach(b=>{
+    b.onclick = ()=>{
+      const accept = b.dataset.offerRespond==='accept';
+      if(accept && !confirm('この提案を受け入れて会社を売却しますか?')) return;
+      const r = respondToIncomingOffer(v.id, accept);
+      toast(r.msg);
+      render();
+      if(v.stage==='failed') closeModal(); else renderVentureModal(ventureId);
+    };
+  });
+  modal.querySelectorAll('[data-defense]').forEach(b=>{
+    b.onclick = ()=>{
+      const r = defendAgainstIncomingTob(v.id, b.dataset.defense);
+      toast(r.msg);
+      renderVentureModal(ventureId); render();
+    };
+  });
 }
 
 // 投資家掲示板タブ: 市場参加者の意見と市場センチメントを表示する
@@ -6036,7 +6394,8 @@ function renderModalBoardTab(st){
   const score = computeStockSentiment(st);
   const label = sentimentLabel(score);
   const labelCls = score>0.12 ? "gain" : (score<-0.12 ? "loss" : "neutral");
-  const posts = st.boardPosts.slice(0,20);
+  const posts = st.boardPosts.slice(0,40);
+  const catColor = (c)=> c==="bullish" ? "var(--green)" : (c==="bearish" ? "var(--red)" : "var(--muted)");
   return `
     <div class="sec-body" style="padding:10px 0;">
       <div style="display:flex; align-items:center; justify-content:space-between;">
@@ -6047,10 +6406,10 @@ function renderModalBoardTab(st){
     </div>
     <div style="padding:0;">
       ${posts.map(p=>`
-        <div class="row" style="cursor:default;">
+        <div class="row" style="cursor:default; align-items:flex-start;">
           <div class="row-left">
-            <div class="nm" style="font-size:12px;"><span class="badge info">${p.persona}</span> <span style="color:var(--muted-2); font-size:9.5px;">${fmtDateShort(p.day)}</span></div>
-            <div class="sub" style="margin-top:4px; color:var(--text); font-size:11.5px; line-height:1.5;">${p.text}</div>
+            <div class="nm" style="font-size:12px;"><span class="badge info" style="border-color:${catColor(p.category)}; color:${catColor(p.category)};">${p.persona}</span> <span style="color:var(--muted-2); font-size:9.5px;">${fmtDateShort(p.day)}</span></div>
+            <div class="sub" style="margin-top:4px; color:var(--text); font-size:11.5px; line-height:1.6; white-space:pre-line;">${p.text}</div>
           </div>
         </div>
       `).join("")}
@@ -6194,11 +6553,6 @@ function renderOrderForm(st, owned, availShares){
     if(r.ok){ clearOrderFormDraft(st.id); render(); renderStockModal(); }
   };
 
-  // チャートタブのSMA/BBトグルボタン(存在する場合のみ)
-  const smaBtn = document.getElementById('toggle-sma');
-  const bbBtn = document.getElementById('toggle-bb');
-  if(smaBtn){ smaBtn.classList.add('active'); smaBtn.onclick=()=>{ smaBtn.classList.toggle('active'); drawCandlestickChart(document.getElementById('detail-chart'), st.history, {labels:true, maxCandles:34, showVolume:true, showSMA:smaBtn.classList.contains('active'), showBB:bbBtn.classList.contains('active'), crossLog:st.crossLog}); }; }
-  if(bbBtn){ bbBtn.onclick=()=>{ bbBtn.classList.toggle('active'); drawCandlestickChart(document.getElementById('detail-chart'), st.history, {labels:true, maxCandles:34, showVolume:true, showSMA:smaBtn?smaBtn.classList.contains('active'):true, showBB:bbBtn.classList.contains('active'), crossLog:st.crossLog}); }; }
 }
 
 // 注文フォームのプレビュー値(注文金額・必要資金・平均取得単価)を更新する。入力欄の値そのものには一切触れない
@@ -6790,6 +7144,7 @@ function migrateState(){
   if(!state.ventures) state.ventures=[];
   if(!state.rivals || !state.rivals.length) state.rivals=generateRivals();
   if(state.activeTob===undefined) state.activeTob=null;
+  if(!state.pendingBoardReactions) state.pendingBoardReactions=[];
   if(!state.globalCompanies || !state.globalCompanies.length) state.globalCompanies=generateGlobalCompanies();
   if(!state.legendaryFeats) state.legendaryFeats={tenbagger:false, oku100:false, oku1000:false, ipoSuccess:false, worldClassCompany:false, marketDominator:false};
   if(!state.pendingCelebrations) state.pendingCelebrations=[];
@@ -6809,6 +7164,9 @@ function migrateState(){
     if(v.founder===undefined) v.founder = state.playerName||"プレイヤー";
     if(v.philosophy===undefined) v.philosophy = "";
     if(v.hq===undefined) v.hq = "東京";
+    if(v.incomingOffer===undefined) v.incomingOffer = null;
+    if(v.incomingHostileTob===undefined) v.incomingHostileTob = null;
+    if(v.dividendPayoutRatio===undefined) v.dividendPayoutRatio = 0.15;
   });
   if(state.acquisitionsUnlockNotified===undefined) state.acquisitionsUnlockNotified=false;
   if(state.pendingIpo && state.pendingIpo.phase===undefined){
