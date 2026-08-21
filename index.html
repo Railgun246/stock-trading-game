@@ -6410,20 +6410,23 @@ function applyDebugDefaults(){
 }
 async function enableDebugMode(){
   isDebugMode = true;
-  const loaded = await loadState(); // isDebugMode切替後なのでデバッグ専用のセーブ領域を参照する
-  const isFresh = !loaded;
-  state = loaded || initState();
+  const result = await loadState(); // isDebugMode切替後なので、デバッグ専用のセーブ領域(別キー)を参照する
+  if(result.ok){
+    state = result.data; // 既存のデバッグセーブがあれば、それを再開する(再起動時などに毎回リセットしない)
+  } else {
+    state = initState();
+    applyDebugDefaults(); // デバッグセーブが存在しない場合のみ、初回のデバッグ用初期値を適用する
+  }
   migrateState();
-  if(isFresh) applyDebugDefaults();
-  saveState();
+  await saveState();
   closeModal();
   render();
   startGameLoop();
 }
 async function disableDebugMode(){
   isDebugMode = false;
-  const loaded = await loadState(); // 通常モードのセーブ領域に戻る(デバッグ中の変更は一切影響しない)
-  state = loaded || initState();
+  const result = await loadState(); // 通常モードのセーブ領域に戻る(デバッグ中の変更は一切影響しない)
+  state = result.ok ? result.data : initState();
   migrateState();
   closeModal();
   render();
@@ -6566,8 +6569,10 @@ async function importSaveDataFromFile(file){
   let parsed;
   try{ parsed = JSON.parse(text); } catch(e){ return {ok:false, msg:"JSON形式が正しくありません"}; }
   if(!validateSaveDataShape(parsed)) return {ok:false, msg:"セーブデータの形式が不正です。復元を中止しました"};
-  // 復元前に、現在のデータを保護するためバックアップを取る
-  try{ await storageSet(BACKUP_STORAGE_KEY, JSON.stringify(state)); } catch(e){ /* バックアップ失敗は復元自体は続行する */ }
+  // 復元前に、現在のデータを保護するためバックアップを取る(通常モードの共有バックアップ枠をデバッグデータで汚染しないようにする)
+  if(!isDebugMode){
+    try{ await storageSet(BACKUP_STORAGE_KEY, JSON.stringify(state)); } catch(e){ /* バックアップ失敗は復元自体は続行する */ }
+  }
   state = parsed;
   migrateState(); // saveDataVersionの確認・不足フィールドの補完(必要なマイグレーション)
   await saveState();
@@ -6575,7 +6580,9 @@ async function importSaveDataFromFile(file){
 }
 // セーブデータを削除して新規ゲームを開始する(削除前に自動バックアップを作成する)
 async function deleteSaveDataAndRestart(){
-  try{ await storageSet(BACKUP_STORAGE_KEY, JSON.stringify(state)); } catch(e){ /* バックアップ失敗しても削除は続行する */ }
+  if(!isDebugMode){
+    try{ await storageSet(BACKUP_STORAGE_KEY, JSON.stringify(state)); } catch(e){ /* バックアップ失敗しても削除は続行する */ }
+  }
   await storageDelete(currentStorageKey());
   state = initState();
   migrateState();
