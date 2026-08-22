@@ -444,15 +444,41 @@ function playerOwnershipPct(st){
 // 差異が生じた場合は市場流通分(個人投資家)で吸収する(現実の株式集計でも端数調整に相当する扱い)
 function reconcileShareholderRegistry(st){
   const holders = ensureShareholderRegistry(st);
-  const sum = holders.reduce((s,h)=>s+h.shares,0);
-  const diff = st.shares - sum;
-  if(diff !== 0){
-    let floatPool = holders.find(h=>h.id==="float_pool");
-    if(!floatPool){
-      floatPool = {id:"float_pool", name:"個人投資家(市場流通分)", type:"individual", shares:0, isMajor:false, isManagement:false, isFounder:false, isParent:false, isStable:false, lockup:false, isFloat:true, style:"mixed"};
-      holders.push(floatPool);
+  let sum = holders.reduce((s,h)=>s+h.shares,0);
+  let diff = st.shares - sum;
+  if(diff === 0) return holders;
+  let floatPool = holders.find(h=>h.id==="float_pool");
+  if(!floatPool){
+    floatPool = {id:"float_pool", name:"個人投資家(市場流通分)", type:"individual", shares:0, isMajor:false, isManagement:false, isFounder:false, isParent:false, isStable:false, lockup:false, isFloat:true, style:"mixed"};
+    holders.push(floatPool);
+  }
+  if(diff>0){
+    // 登録簿の合計が発行済株式数に不足している → float_poolへ不足分を追加する
+    floatPool.shares += diff;
+  } else {
+    // 登録簿の合計が発行済株式数を超えている → まずfloat_poolから吸収し、
+    // それでも足りない場合は他の保有者から比例的に減らし、必ず一致させる(0でクランプして放置しない)
+    const excess = -diff;
+    const absorbedByFloat = Math.min(floatPool.shares, excess);
+    floatPool.shares -= absorbedByFloat;
+    let remainingExcess = excess - absorbedByFloat;
+    if(remainingExcess>0){
+      const others = holders.filter(h=>h.id!=="float_pool" && h.shares>0);
+      const othersTotal = others.reduce((s,h)=>s+h.shares,0);
+      if(othersTotal>0){
+        others.forEach(h=>{
+          const reduction = Math.floor(remainingExcess*(h.shares/othersTotal));
+          h.shares = Math.max(0, h.shares-reduction);
+        });
+      }
+      // 端数調整: 比例配分の丸め誤差が残る場合、最大保有者で最終的に一致させる
+      sum = holders.reduce((s,h)=>s+h.shares,0);
+      diff = st.shares - sum;
+      if(diff!==0){
+        const largest = holders.reduce((a,b)=> b.shares>a.shares ? b : a, holders[0]);
+        largest.shares = Math.max(0, largest.shares+diff);
+      }
     }
-    floatPool.shares = Math.max(0, floatPool.shares+diff);
   }
   return holders;
 }
@@ -636,9 +662,34 @@ function pickBoardCategory(sentimentScore, persona){
   const personalBias = sentimentScore + (persona.bias||0) + rand(-0.4,0.4);
   return personalBias>0.15 ? "bullish" : (personalBias<-0.15 ? "bearish" : "neutral");
 }
+// 噂・観測・業界情報の投稿(公式ニュース・適時開示には載らない情報)。
+// 実在するデータ(業績・成長率・テーマ)に紐づけつつ、内容の正確性(reliability)は投稿ごとにばらつかせる。
+// プレイヤー自身が情報の信頼性を判断するための要素であり、必ずしも真実とは限らない。
+const BOARD_RUMOR_TEMPLATES = [
+  (st)=>`${st.name}、来期かなり厳しいらしい。知り合いから聞いた話だけど。`,
+  (st)=>`${st.name}が新工場を建設するという噂がある。本当なら期待できそう。`,
+  (st)=>`大手企業から${st.name}に大型案件が入ったらしい。真偽は不明。`,
+  (st)=>`${st.name}の新製品、業界筋ではかなり評判がいいらしい。`,
+  (st)=>`${st.name}の社長交代の噂が出ている。次の決算で発表があるかも。`,
+  (st)=>`${st.name}が海外企業との提携を検討しているという話を聞いた。`,
+  (st)=>`${st.name}の主力製品が競合に押され始めているという業界の声がある。`,
+  (st)=>`${st.name}で社員が大量に辞めているという噂を耳にした。`,
+  (st)=>`${st.name}、買収されるんじゃないかという憶測が出回っている。`,
+  (st)=>`${st.name}の工場でトラブルがあったらしいという未確認情報が流れている。`,
+  (st)=>`${st.sector}業界の知人によると、${st.name}の受注環境は思ったより悪くないらしい。`,
+  (st)=>`${st.name}が近々増資するのではという観測がある。`,
+];
+function generateRumorPost(st){
+  const persona = pick(BOARD_PERSONAS);
+  const text = pick(BOARD_RUMOR_TEMPLATES)(st);
+  // 信頼性は内部的に保持するのみで、プレイヤーには開示しない(自分で真偽を判断させる)
+  const reliability = pick(["true","true","partial","partial","false"]);
+  return {persona: persona.name, text, category:"rumor", day: state.day, reliability};
+}
 function generateBoardPost(st){
   const sentimentScore = computeStockSentiment(st);
   const persona = pick(BOARD_PERSONAS);
+  if(Math.random()<0.22) return generateRumorPost(st); // 一定割合は公式情報に基づかない噂・観測を投稿する
   const category = pickBoardCategory(sentimentScore, persona);
   const text = pick(BOARD_POST_TEMPLATES[category])(st);
   return {persona: persona.name, text, category, day: state.day};
@@ -3010,6 +3061,7 @@ function foundCompany(params){
     parentVentureId:null, subsidiaries:[],
     isFounded:true, founder:(state.playerName||"プレイヤー"), philosophy:(philosophy||"").trim(), hq:hq||"東京",
     successBase: sector.successBase, moonshotPotential: Math.random()<0.05,
+    newBusinesses:[], history:[{day:state.day, text:`${(state.playerName||"プレイヤー")}が${sector.label}分野で創業した(資本金${fmtYen(capital)})`}],
   };
   state.ventures.push(venture);
   state.stats.foundedCount = (state.stats.foundedCount||0)+1;
@@ -3103,6 +3155,7 @@ function createVentureObject(def, method, cost, parentVentureId){
     productPipeline:[], patents:0, overseasRegions:[],
     lastBoardMeetingDay:state.day, lastShareholderMeetingDay:state.day,
     parentVentureId: parentVentureId||null, subsidiaries:[],
+    newBusinesses:[], history:[{day:state.day, text:`${def.name}を${m.label}した(投資額${fmtYen(cost)})`}],
   };
 }
 // 買収交渉: 提案→経営陣の反応→主要株主の反応→価格交渉→成立/不成立、という流れを一括で解決する
@@ -3156,8 +3209,8 @@ function convertStockToVenture(st, stake, method){
     executives:{ceo:null,cfo:null,cto:null,coo:null}, rdTheme:null, rdSpend:0,
     productPipeline:[], patents:0, overseasRegions:[],
     lastBoardMeetingDay:state.day, lastShareholderMeetingDay:state.day,
-    parentVentureId:null, subsidiaries:[],
-    history:[{day:state.day, text:`${method==="hostile_tob"?"TOB(株式公開買付)":"敵対的買収"}により経営権を取得`}],
+    parentVentureId:null, subsidiaries:[], newBusinesses:[],
+    history:[{day:state.day, text:`${method==="hostile_tob"?"TOB(株式公開買付)":(method==="market_accumulation"?"市場での買い集め":"敵対的買収")}により経営権を取得`}],
   };
 }
 
@@ -3167,6 +3220,43 @@ function convertStockToVenture(st, stake, method){
    ========================================================================== */
 const TOB_PERSONA_STYLES = {institutional:"機関投資家", foreign:"外国人投資家", individual:"個人投資家", company:"安定株主", player:"プレイヤー", mixed:"個人投資家"};
 // 買収難易度(0〜1): 経営陣・安定株主比率、企業の質が高いほど困難になる
+// 保有比率に応じた株主としての影響力の段階(現実の会社法の考え方を参考にした目安)
+const SHAREHOLDER_INFLUENCE_TIERS = [
+  {min:0.501, label:"実質的な経営支配", desc:"議決権の過半数を握り、経営を直接支配できる水準です。"},
+  {min:0.334, label:"重要議案への拒否権", desc:"特別決議を単独で阻止できる水準です。"},
+  {min:0.20,  label:"経営への影響力大", desc:"持分法適用など、経営への影響力が強い水準です。"},
+  {min:0.10,  label:"主要株主", desc:"大量保有報告書の提出対象となる主要株主です。"},
+  {min:0.05,  label:"大株主", desc:"5%以上を保有する大株主です。"},
+];
+function computeShareholderInfluenceTier(pct){
+  const ratio = pct/100;
+  for(const tier of SHAREHOLDER_INFLUENCE_TIERS){ if(ratio>=tier.min) return tier; }
+  return null;
+}
+// 市場での買い集めにより過半数を保有した場合、TOBを経ずに直接経営に参画できるようにする
+// (敵対的TOBは「防衛される側の抵抗を打ち破って奪う」ルート、こちらは「静かに買い集めて実質支配する」ルート)
+function canTakeDirectManagementControl(st){
+  const linkedVenture = state.ventures.find(v=>v.listedStockId===st.id && v.stage==="listed");
+  if(linkedVenture) return false;
+  const pos = state.portfolio[st.id];
+  const pct = pos ? pos.shares/st.shares : 0;
+  return pct>0.5 && canUnlockAcquisitions();
+}
+function takeDirectManagementControl(stockId){
+  const st = state.stocks.find(s=>s.id===stockId);
+  if(!st) return {ok:false, msg:"銘柄が見つかりません"};
+  if(!canTakeDirectManagementControl(st)) return {ok:false, msg:"議決権の過半数を保有していないか、条件を満たしていません"};
+  const pos = state.portfolio[st.id];
+  const stake = pos.shares/st.shares;
+  const v = convertStockToVenture(st, stake, "market_accumulation");
+  v.history = [{day:state.day, text:`市場での買い集めにより議決権の${(stake*100).toFixed(1)}%を取得し、経営に参画した`}];
+  state.ventures.push(v);
+  state.stats.acquisitionCount = (state.stats.acquisitionCount||0)+1;
+  pushNews(`${st.name}の議決権の過半数を取得し、経営権を掌握した。`, {stars:5, kind:"confirmed", category:"venture", stockId:st.id, type:"event"});
+  queueCelebration("経営権取得", `${st.name}の経営に参画し、再建の舵取りを担うことになった。`);
+  saveState();
+  return {ok:true, msg:"経営権を取得しました", ventureId:v.id};
+}
 function computeTakeoverDifficultyForStock(st){
   const holders = getUnifiedShareholders(st);
   const stablePct = holders.filter(h=>h.isStable).reduce((s,h)=>s+h.shares,0)/st.shares;
@@ -3408,7 +3498,162 @@ const VENTURE_ACTIONS = {
   marketing: {label:"マーケティング投資", costRatio:0.05, effect:(v)=>{ ventureTarget(v).revenue*=rand(1.03,1.08); if(Math.random()<0.25) v.competitiveness=Math.min(5,v.competitiveness+1); }, failEffect:(v)=>{ ventureTarget(v).revenue*=0.97; } },
   overseas:  {label:"海外展開",         costRatio:0.15, effect:(v)=>{ const t=ventureTarget(v); t.revenue*=rand(1.12,1.28); t.growth=clamp(t.growth+rand(2,6),-15,60); }, failEffect:(v)=>{ const t=ventureTarget(v); t.revenue*=0.88; t.quality=clamp(t.quality-0.04,0,0.97); } },
   ma:        {label:"M&A",              costRatio:0.20, effect:(v)=>{ const t=ventureTarget(v); t.revenue*=rand(1.20,1.40); t.profit*=rand(1.15,1.35); if(Math.random()<0.3) v.management=Math.min(5,v.management+1); }, failEffect:(v)=>{ const t=ventureTarget(v); t.profit*=0.80; t.quality=clamp(t.quality-0.05,0,0.97); } },
+  downsize:  {label:"不採算事業の整理",  costRatio:0.03, effect:(v)=>{ const t=ventureTarget(v); t.revenue*=rand(0.85,0.95); v.cashBalance=(v.cashBalance||0)+Math.round((v.investedCapital||v.cumulativeInvestment||1e8)*0.05); }, failEffect:(v)=>{ const t=ventureTarget(v); t.quality=clamp(t.quality-0.02,0,0.97); } },
 };
+
+/* ==========================================================================
+   新規事業開拓(既存事業とは別の全く新しい事業領域へ参入する)
+   ========================================================================== */
+const NEW_BUSINESS_SECTORS = [
+  {key:"ai",           label:"AI",             relatedTags:["ai"]},
+  {key:"semiconductor",label:"半導体",         relatedTags:["semiconductor"]},
+  {key:"cloud",        label:"クラウド",       relatedTags:["ai","software"]},
+  {key:"game",         label:"ゲーム",         relatedTags:["software"]},
+  {key:"ec",           label:"EC",             relatedTags:["software"]},
+  {key:"finance",      label:"金融",           relatedTags:["finance"]},
+  {key:"logistics",    label:"物流",           relatedTags:["transport"]},
+  {key:"space",        label:"宇宙",           relatedTags:["space"]},
+  {key:"defense",      label:"防衛",           relatedTags:["defense"]},
+  {key:"energy",       label:"エネルギー",     relatedTags:["energy"]},
+  {key:"renewable",    label:"再生可能エネルギー", relatedTags:["energy"]},
+  {key:"ev",           label:"EV",             relatedTags:["auto"]},
+  {key:"robot",        label:"ロボット",       relatedTags:["robot"]},
+  {key:"medical",      label:"医療",           relatedTags:["bio"]},
+  {key:"bio",          label:"バイオ",         relatedTags:["bio"]},
+  {key:"food",         label:"食品",           relatedTags:["staple"]},
+  {key:"realestate",   label:"不動産",         relatedTags:[]},
+  {key:"education",    label:"教育",           relatedTags:[]},
+  {key:"entertainment",label:"エンターテインメント", relatedTags:["software"]},
+];
+const NEW_BUSINESS_STAGE_ORDER = ["concept","rd","trial","launch","growth","mature"];
+const NEW_BUSINESS_STAGE_LABELS = {concept:"構想", rd:"研究開発", trial:"試験運用", launch:"サービス開始", growth:"成長期", mature:"成熟期", failed:"撤退"};
+// 参入難易度(0=参入しやすい 〜 1=参入しにくい)。自社の既存テーマとの重なりで判定する
+function computeBusinessEntryDifficulty(v, sectorKey){
+  const sector = NEW_BUSINESS_SECTORS.find(s=>s.key===sectorKey);
+  if(!sector) return 0.7;
+  const overlap = (v.themeTags||[]).some(t=>sector.relatedTags.includes(t));
+  return overlap ? 0.28 : 0.62;
+}
+function canStartNewBusiness(v, sectorKey){
+  if(!v || (v.stage!=="private" && v.stage!=="listed")) return {ok:false, msg:"この企業では新規事業を開始できません"};
+  if(!NEW_BUSINESS_SECTORS.find(s=>s.key===sectorKey)) return {ok:false, msg:"不正な事業分野です"};
+  if((v.newBusinesses||[]).some(b=>b.sectorKey===sectorKey && b.stage!=="failed")) return {ok:false, msg:"すでにこの分野に参入しています"};
+  return {ok:true};
+}
+function startNewBusiness(ventureId, sectorKey, investAmount){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  const check = canStartNewBusiness(v, sectorKey);
+  if(!check.ok) return check;
+  if(!investAmount || investAmount<=0) return {ok:false, msg:"投資額を入力してください"};
+  if((v.cashBalance||0) < investAmount) return {ok:false, msg:"企業の現金が不足しています"};
+  const sector = NEW_BUSINESS_SECTORS.find(s=>s.key===sectorKey);
+  v.cashBalance -= investAmount;
+  const difficulty = computeBusinessEntryDifficulty(v, sectorKey);
+  // 投資額が大きいほど、また自社の地力(quality)が高いほど成功確率が上がる。参入難易度が高い分野ほど下がる
+  const successProb = clamp(0.55 - difficulty*0.3 + clamp(investAmount/2e9,0,0.15) + ((v.quality||0.5)-0.5)*0.3, 0.1, 0.85);
+  const biz = {
+    id:"nb"+Date.now()+randInt(0,999), sectorKey, label:sector.label, stage:"concept",
+    investedAmount:investAmount, cumulativeInvestment:investAmount, revenue:0, profit:0,
+    successProb, competitorStrength: rand(0.3,0.8), difficulty,
+    startDay: state.day, lastUpdateDay: state.day,
+  };
+  if(!v.newBusinesses) v.newBusinesses=[];
+  v.newBusinesses.push(biz);
+  if(!v.history) v.history=[];
+  v.history.push({day:state.day, text:`${sector.label}分野への新規事業参入を決定(投資額${fmtYen(investAmount)})`});
+  pushNews(`${v.name}が${sector.label}分野への新規事業参入を発表した。`, {stars:4, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+  saveState();
+  return {ok:true, msg:"新規事業を開始しました"};
+}
+// 新規事業への追加投資(成功確率を高める・段階の進行を後押しする)
+function investInNewBusiness(ventureId, businessId, amount){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v) return {ok:false, msg:"対象企業が見つかりません"};
+  const biz = (v.newBusinesses||[]).find(b=>b.id===businessId);
+  if(!biz || biz.stage==="failed" || biz.stage==="mature") return {ok:false, msg:"この事業には追加投資できません"};
+  if((v.cashBalance||0) < amount) return {ok:false, msg:"企業の現金が不足しています"};
+  v.cashBalance -= amount;
+  biz.cumulativeInvestment += amount;
+  biz.successProb = clamp(biz.successProb + clamp(amount/3e9,0,0.12), 0.1, 0.9);
+  saveState();
+  return {ok:true, msg:"追加投資を実施しました(成功確率が向上)"};
+}
+// 新規事業の段階を進める(構想→研究開発→試験運用→サービス開始→成長期→成熟期、または失敗して撤退)
+function updateNewBusinesses(v){
+  if(!v.newBusinesses || !v.newBusinesses.length) return;
+  const t = ventureTarget(v);
+  const stageDuration = {concept:45, rd:120, trial:90, launch:75, growth:180};
+  v.newBusinesses.forEach(biz=>{
+    if(biz.stage==="failed" || biz.stage==="mature") return;
+    const elapsed = state.day - biz.lastUpdateDay;
+    if(elapsed < (stageDuration[biz.stage]||999999)){
+      if(biz.stage!=="concept"){
+        // 育成中は投資額に応じたわずかな維持コストが発生する(赤字を垂れ流す段階)
+        v.cashBalance = Math.max(0, (v.cashBalance||0) - biz.investedAmount*0.0008);
+      }
+      return;
+    }
+    biz.lastUpdateDay = state.day;
+    if(biz.stage==="concept"){ biz.stage="rd"; return; }
+    if(biz.stage==="rd"){
+      if(Math.random()<biz.successProb){ biz.stage="trial"; }
+      else {
+        biz.stage="failed";
+        if(!v.history) v.history=[];
+        v.history.push({day:state.day, text:`${biz.label}事業は研究開発段階で断念した`});
+        pushNews(`${v.name}の${biz.label}事業は研究開発段階で断念された。投資額の回収は困難な見通し。`, {stars:3, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+      }
+      return;
+    }
+    if(biz.stage==="trial"){
+      biz.stage="launch";
+      biz.revenue = biz.investedAmount*0.05;
+      pushNews(`${v.name}の${biz.label}事業がサービスを開始した。`, {stars:3, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+      return;
+    }
+    if(biz.stage==="launch"){
+      // 競合との競争を経て、成長軌道に乗るか撤退に追い込まれるかが決まる
+      const competitionRoll = Math.random();
+      if(competitionRoll < (1-biz.competitorStrength)*0.7+0.15){
+        biz.stage="growth";
+        biz.revenue = biz.investedAmount*0.15;
+        biz.profit = biz.revenue*rand(0.05,0.15);
+        if(!v.history) v.history=[];
+        v.history.push({day:state.day, text:`${biz.label}事業が成長軌道に乗った`});
+        pushNews(`【新規事業成功】${v.name}の${biz.label}事業が急成長を始めた。`, {stars:5, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+        queueCelebration("新規事業成功!", `${v.name}が立ち上げた${biz.label}事業が軌道に乗った。`);
+      } else {
+        biz.stage="failed";
+        if(!v.history) v.history=[];
+        v.history.push({day:state.day, text:`${biz.label}事業は競合に敗れ撤退した`});
+        pushNews(`${v.name}の${biz.label}事業は競合に敗れ、撤退を余儀なくされた。`, {stars:4, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+      }
+      return;
+    }
+    if(biz.stage==="growth"){
+      biz.revenue *= rand(1.15,1.5);
+      biz.profit = biz.revenue*rand(0.05,0.2);
+      // 会社全体の業績への影響は、過度に大きくならないよう一部だけを反映する
+      t.revenue += biz.revenue*0.3;
+      t.profit += biz.profit*0.3;
+      if(Math.random()<0.15) biz.stage="mature";
+    }
+  });
+}
+// 事業撤退(手動): 育成中・成長中の新規事業から任意のタイミングで撤退する
+function divestNewBusiness(ventureId, businessId){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v) return {ok:false, msg:"対象企業が見つかりません"};
+  const biz = (v.newBusinesses||[]).find(b=>b.id===businessId);
+  if(!biz || biz.stage==="failed") return {ok:false, msg:"対象の事業が見つかりません"};
+  biz.stage = "failed";
+  if(!v.history) v.history=[];
+  v.history.push({day:state.day, text:`${biz.label}事業から自主的に撤退した`});
+  pushNews(`${v.name}が${biz.label}事業からの撤退を決定した。`, {stars:2, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"flavor"});
+  saveState();
+  return {ok:true, msg:"事業を撤退しました"};
+}
+
 function investInVenture(ventureId, actionKey){
   const v = state.ventures.find(x=>x.id===ventureId);
   if(!v || (v.stage!=="private" && v.stage!=="listed")) return {ok:false, msg:"この企業には投資できません"};
@@ -3985,6 +4230,7 @@ function updateVentures(){
     }
     if(v.stage!=="private" && v.stage!=="listed") return;
     updateProductPipeline(v);
+    updateNewBusinesses(v);
     checkFundraisingNeed(v);
     checkVentureFailureRisk(v);
     if(v.stage!=="private" && v.stage!=="listed") return; // 上記チェックで倒産/停滞した場合はここで処理を終える
@@ -4276,6 +4522,33 @@ function computeHealthScore(st){
   const closes = st.history.slice(-20).map(c=>c.c);
   const trend = closes.length>=2 ? (closes[closes.length-1]/closes[0]-1) : 0;
   return clamp(st.quality*0.5 + clamp(st.growth/30,0,1)*0.3 + clamp(trend*2+0.5,0,1)*0.2, 0, 1);
+}
+// 企業状態(🟢〜⚠)を実際の財務データ(売上成長率・利益率・地力・既存の上場廃止パイプライン進行度)から判定する。ランダム判定は行わない
+function computeCompanyHealthStatus(st){
+  if(st.declineStage>=5) return {level:"bankruptcy_risk", label:"倒産リスク", emoji:"⚠"};
+  if(st.declineStage>=3) return {level:"crisis", label:"経営危機", emoji:"🔴"};
+  if(st.declineStage>=1) return {level:"distressed", label:"業績不振", emoji:"🟠"};
+  const margin = st.revenue>0 ? st.profit/st.revenue : -1;
+  const health = computeHealthScore(st);
+  // 赤字・マイナス成長など、明確に悪い指標が複数重なった場合のみ警告を出す(通常運転の企業まで不振扱いにしない)
+  let warnScore = 0;
+  if(margin<0) warnScore += 2;
+  else if(margin<0.03) warnScore += 1;
+  if(st.growth<-5) warnScore += 2;
+  else if(st.growth<0) warnScore += 1;
+  if(health<0.25) warnScore += 1;
+  if(warnScore===0) return {level:"stable", label:"安定企業", emoji:"🟢"};
+  if(warnScore<=1) return {level:"declining", label:"業績悪化", emoji:"🟡"};
+  if(warnScore<=3) return {level:"distressed", label:"業績不振", emoji:"🟠"};
+  return {level:"crisis", label:"経営危機", emoji:"🔴"};
+}
+// 表示用の倒産リスク目安(実際の上場廃止判定は既存のupdateDeclinePipelineが管理しており、これはあくまで参考値)
+function computeBankruptcyRiskDisplay(st){
+  if(st.declineStage>=5) return 0.7;
+  if(st.declineStage>=3) return 0.25;
+  if(st.declineStage>=1) return 0.08;
+  const health = computeHealthScore(st);
+  return clamp((1-health)*0.15, 0, 0.5);
 }
 const DECLINE_STAGE_DEFS = [
   null,
@@ -5776,8 +6049,12 @@ function renderStockModal(){
   const stopBadge = today.stopHigh ? `<span class="badge stop">ストップ高</span>` : (today.stopLow ? `<span class="badge stopdown">ストップ安</span>` : "");
   const linkedVenture = state.ventures.find(v=>v.listedStockId===st.id && v.stage==="listed");
   const ventureBadge = linkedVenture ? `<span class="badge gain">あなたが育てた企業</span>` : "";
+  const healthStatus = computeCompanyHealthStatus(st);
+  const healthBadge = healthStatus.level!=="stable" ? `<span class="badge ${healthStatus.level==='declining'?'neutral':(healthStatus.level==='distressed'?'warn':'stop')}">${healthStatus.emoji} ${healthStatus.label}</span>` : "";
   const playerVotingPct = pos ? (pos.shares/st.shares*100) : 0;
   const showTakeoverEntry = !linkedVenture && playerVotingPct>=5 && canUnlockAcquisitions();
+  const influenceTier = playerVotingPct>0 ? computeShareholderInfluenceTier(playerVotingPct) : null;
+  const showDirectControl = canTakeDirectManagementControl(st);
 
   modal.innerHTML = `
     <div class="modal-handle"></div>
@@ -5789,9 +6066,10 @@ function renderStockModal(){
       <div id="stock-modal-price" style="font-size:25px; font-weight:800;">¥${fmtNum(st.price)}</div>
       <span id="stock-modal-pct" class="pill ${pct>=0?'gain':'loss'}" style="font-size:12px;">${fmtPct(pct)}</span>
     </div>
-    <div id="stock-modal-badges" style="margin-bottom:4px; display:flex; gap:5px; flex-wrap:wrap;">${themeBadge}${rumorBadge}${stopBadge}${ventureBadge}</div>
+    <div id="stock-modal-badges" style="margin-bottom:4px; display:flex; gap:5px; flex-wrap:wrap;">${themeBadge}${rumorBadge}${stopBadge}${ventureBadge}${healthBadge}${influenceTier?`<span class="badge info">${influenceTier.label}(${playerVotingPct.toFixed(1)}%)</span>`:''}</div>
     <button class="btn btn-cyan btn-block" id="btn-open-order-menu" style="margin-bottom:8px; font-weight:800;">注文</button>
     ${linkedVenture ? `<button class="btn btn-ghost btn-block btn-sm" id="btn-manage-venture" style="margin-bottom:8px;">この企業を経営する →</button>` : ''}
+    ${showDirectControl ? `<button class="btn btn-cyan btn-block btn-sm" id="btn-take-direct-control" style="margin-bottom:8px;">経営権を取得する(議決権${playerVotingPct.toFixed(1)}%)</button>` : ''}
     ${showTakeoverEntry ? `<button class="btn btn-red btn-block btn-sm" id="btn-open-takeover" style="margin-bottom:8px;">M&A:敵対的買収を検討する(保有${playerVotingPct.toFixed(1)}%)</button>` : ''}
 
     <div class="subtab-row">
@@ -5812,6 +6090,13 @@ function renderStockModal(){
   if(manageBtn) manageBtn.onclick = ()=>{ openVentureModal(linkedVenture.id); };
   const takeoverBtn = modal.querySelector('#btn-open-takeover');
   if(takeoverBtn) takeoverBtn.onclick = ()=>{ openTakeoverModal(st.id); };
+  const directControlBtn = modal.querySelector('#btn-take-direct-control');
+  if(directControlBtn) directControlBtn.onclick = ()=>{
+    if(!confirm(`${st.name}の経営権を取得しますか?保有株式はそのままこの企業の経営権として扱われます。`)) return;
+    const r = takeDirectManagementControl(st.id);
+    toast(r.msg);
+    if(r.ok){ render(); openVentureModal(r.ventureId); }
+  };
 
   renderModalSubbody(st);
 }
@@ -5878,7 +6163,9 @@ function refreshStockModalLive(){
     const rumor = state.pendingRumors.find(r=>r.stockId===st.id);
     const rumorBadge = rumor ? `<span class="badge warn">噂:${rumor.direction==='up'?'好材料':'悪材料'}(${rumor.magKey})</span>` : "";
     const stopBadge = today.stopHigh ? `<span class="badge stop">ストップ高</span>` : (today.stopLow ? `<span class="badge stopdown">ストップ安</span>` : "");
-    badgesEl.innerHTML = themeBadge+rumorBadge+stopBadge;
+    const healthStatus = computeCompanyHealthStatus(st);
+    const healthBadge = healthStatus.level!=="stable" ? `<span class="badge ${healthStatus.level==='declining'?'neutral':(healthStatus.level==='distressed'?'warn':'stop')}">${healthStatus.emoji} ${healthStatus.label}</span>` : "";
+    badgesEl.innerHTML = themeBadge+rumorBadge+stopBadge+healthBadge;
   }
   if(modalSubtab==="chart"){
     drawStockDetailChart(st);
@@ -5986,6 +6273,7 @@ function renderModalKaishahoTab(st){
       <div class="stat-box"><div class="l">純利益</div><div class="v">${fmtYen(st.profit)}</div></div>
     </div>
     <table class="dtable" style="margin-top:4px;">
+      <tr><td>企業状態</td><td>${(()=>{ const h=computeCompanyHealthStatus(st); return `${h.emoji} ${h.label}`; })()}</td></tr>
       <tr><td>EPS(1株益)</td><td>¥${eps.toFixed(1)}</td></tr>
       <tr><td>BPS(1株純資産)</td><td>¥${bps.toFixed(1)}</td></tr>
       <tr><td>PER</td><td>${per.toFixed(1)}倍</td></tr>
@@ -7347,7 +7635,7 @@ function renderModalBoardTab(st){
   const label = sentimentLabel(score);
   const labelCls = score>0.12 ? "gain" : (score<-0.12 ? "loss" : "neutral");
   const posts = st.boardPosts.slice(0,40);
-  const catColor = (c)=> c==="bullish" ? "var(--green)" : (c==="bearish" ? "var(--red)" : "var(--muted)");
+  const catColor = (c)=> c==="bullish" ? "var(--green)" : (c==="bearish" ? "var(--red)" : (c==="rumor" ? "var(--purple)" : "var(--muted)"));
   return `
     <div class="sec-body" style="padding:10px 0;">
       <div style="display:flex; align-items:center; justify-content:space-between;">
@@ -7360,7 +7648,7 @@ function renderModalBoardTab(st){
       ${posts.map(p=>`
         <div class="row" style="cursor:default; align-items:flex-start;">
           <div class="row-left">
-            <div class="nm" style="font-size:12px;"><span class="badge info" style="border-color:${catColor(p.category)}; color:${catColor(p.category)};">${p.persona}</span> <span style="color:var(--muted-2); font-size:9.5px;">${fmtDateShort(p.day)}</span></div>
+            <div class="nm" style="font-size:12px;"><span class="badge info" style="border-color:${catColor(p.category)}; color:${catColor(p.category)};">${p.persona}${p.category==='rumor'?' ・ 未確認情報':''}</span> <span style="color:var(--muted-2); font-size:9.5px;">${fmtDateShort(p.day)}</span></div>
             <div class="sub" style="margin-top:4px; color:var(--text); font-size:11.5px; line-height:1.6; white-space:pre-line;">${p.text}</div>
           </div>
         </div>
@@ -8117,6 +8405,8 @@ function migrateState(){
     if(v.incomingOffer===undefined) v.incomingOffer = null;
     if(v.incomingHostileTob===undefined) v.incomingHostileTob = null;
     if(v.dividendPayoutRatio===undefined) v.dividendPayoutRatio = 0.15;
+    if(!v.newBusinesses) v.newBusinesses = [];
+    if(!v.history) v.history = [{day:v.acquireDay||1, text:`${v.name}を${ventureMethodLabel(v)}(投資額${fmtYen(v.investedCapital||0)})`}];
   });
   if(state.acquisitionsUnlockNotified===undefined) state.acquisitionsUnlockNotified=false;
   if(state.pendingIpo && state.pendingIpo.phase===undefined){
