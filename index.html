@@ -3540,6 +3540,19 @@ function canStartNewBusiness(v, sectorKey){
   if((v.newBusinesses||[]).some(b=>b.sectorKey===sectorKey && b.stage!=="failed")) return {ok:false, msg:"すでにこの分野に参入しています"};
   return {ok:true};
 }
+// プレイヤー自身の資金を経営中の企業へ追加出資する(業績不振企業を立て直すための資金注入。企業自身のキャッシュフローに頼らない)
+function injectCapitalIntoVenture(ventureId, amount){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v || (v.stage!=="private" && v.stage!=="listed")) return {ok:false, msg:"この企業には出資できません"};
+  if(!amount || amount<=0) return {ok:false, msg:"金額を入力してください"};
+  if(availableCash()<amount) return {ok:false, msg:"資金が不足しています"};
+  state.cash -= amount;
+  v.cashBalance = (v.cashBalance||0) + amount;
+  v.cumulativeInvestment = (v.cumulativeInvestment||0) + amount;
+  pushNews(`${state.playerName||"プレイヤー"}が${v.name}へ${fmtYen(amount)}の追加出資を行った。`, {stars:2, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+  saveState();
+  return {ok:true, msg:`${fmtYen(amount)}を出資しました`};
+}
 function startNewBusiness(ventureId, sectorKey, investAmount){
   const v = state.ventures.find(x=>x.id===ventureId);
   const check = canStartNewBusiness(v, sectorKey);
@@ -3654,6 +3667,19 @@ function divestNewBusiness(ventureId, businessId){
   return {ok:true, msg:"事業を撤退しました"};
 }
 
+// 企業規模の安全弁: 個々の施策(研究開発/設備投資/特別イベント等)が散在して業績を掛け算で伸ばすため、
+// 個別の乗算箇所すべてを都度ダンピングする代わりに、ここで基準値からの倍率に上限を設ける(通常のプレイでは到達しない極端な暴走だけを防ぐ)
+function applyVentureScaleSafety(v){
+  const t = ventureTarget(v);
+  if(!t) return;
+  if(v.baseRevenue===undefined) v.baseRevenue = Math.max(1e8, t.revenue);
+  if(v.baseProfit===undefined) v.baseProfit = Math.max(1e7, Math.abs(t.profit)||1e7);
+  const maxScale = 8000; // 基準値の8000倍(創業期の中小企業が業界大手へ成長する程度)を上限とする
+  const revScale = t.revenue/v.baseRevenue;
+  if(revScale>maxScale) t.revenue = v.baseRevenue*maxScale*(1+rand(-0.02,0.02));
+  const profitScale = Math.abs(t.profit)/v.baseProfit;
+  if(profitScale>maxScale) t.profit = Math.sign(t.profit||1)*v.baseProfit*maxScale*(1+rand(-0.02,0.02));
+}
 function investInVenture(ventureId, actionKey){
   const v = state.ventures.find(x=>x.id===ventureId);
   if(!v || (v.stage!=="private" && v.stage!=="listed")) return {ok:false, msg:"この企業には投資できません"};
@@ -3668,6 +3694,7 @@ function investInVenture(ventureId, actionKey){
   if(success) action.effect(v); else action.failEffect(v);
   const t = ventureTarget(v);
   t.revenue = Math.max(t.revenue, 1e6);
+  applyVentureScaleSafety(v);
   pushNews(`${v.name}への${action.label}が${success?"成功した":"期待した成果を上げられなかった"}。`, {stars:2, kind:"confirmed", category:"venture", stockId:v.listedStockId, type: success?"good":"event"});
   saveState();
   return {ok:true, msg: success ? `${action.label}が成功した` : `${action.label}は期待した成果を上げられなかった`};
@@ -4247,8 +4274,8 @@ function updateVentures(){
     }
 
     // 独占技術・大型契約(超低確率、上場後も継続)
-    if(tryExclusiveTechBreakthrough(v)){ /* 発生済み */ }
-    else tryMegaContract(v);
+    if(tryExclusiveTechBreakthrough(v)){ applyVentureScaleSafety(v); }
+    else if(tryMegaContract(v)){ applyVentureScaleSafety(v); }
 
     if(state.day - v.lastEventDay < randInt(28,42)) return;
     v.lastEventDay = state.day;
@@ -4256,10 +4283,23 @@ function updateVentures(){
     const p = VENTURE_POLICIES[v.policy] || VENTURE_POLICIES.growth;
     const execBonus = ventureExecBonus(v);
     const t = ventureTarget(v);
-    t.growth = clamp(t.growth + rand(p.growthRange[0],p.growthRange[1]) + execBonus.growthBonus, -15, 45);
-    t.profit *= rand(p.profitMultRange[0],p.profitMultRange[1]) * execBonus.profitMult;
-    t.revenue *= (1+t.growth/100/4);
+    // 基準値(初回のみ設定): 公開株と同様に、業績が基準値から大きく外れて拡大するほど、さらなる伸びには
+    // 収穫逓減がかかるようにする(成長率にも緩やかな平均回帰を持たせる)。既存セーブのベンチャーにも安全に補完する
+    if(v.baseRevenue===undefined) v.baseRevenue = Math.max(1e8, t.revenue);
+    if(v.baseProfit===undefined) v.baseProfit = Math.max(1e7, Math.abs(t.profit)||1e7);
+    const growthTarget = 8;
+    const growthMeanReversion = (t.growth-growthTarget)*-0.15;
+    t.growth = clamp(t.growth + rand(p.growthRange[0],p.growthRange[1]) + execBonus.growthBonus + growthMeanReversion, -15, 45);
+    const profitScale = Math.abs(t.profit)/v.baseProfit;
+    const profitDamping = clamp(1/Math.pow(1+Math.max(0,Math.log10(profitScale)),1.8), 0.02, 1);
+    const rawProfitMult = rand(p.profitMultRange[0],p.profitMultRange[1]) * execBonus.profitMult;
+    const dampedProfitMult = rawProfitMult>=1 ? 1+(rawProfitMult-1)*profitDamping : rawProfitMult;
+    t.profit *= dampedProfitMult;
+    const revenueScale = t.revenue/v.baseRevenue;
+    const revenueDamping = clamp(1/Math.pow(1+Math.max(0,Math.log10(revenueScale)),1.6), 0.03, 1);
+    t.revenue *= (1+(t.growth/100/4)*revenueDamping);
     t.quality = clamp(t.quality + rand(p.qualityRange[0],p.qualityRange[1]) + execBonus.qualityBonus, 0.05, 0.97);
+    applyVentureScaleSafety(v);
     v.marketShare = clamp((v.marketShare||5) + rand(-0.5,1.0), 0, 100);
     v.cashBalance = Math.max(0, (v.cashBalance||0) + t.profit*0.3);
 
@@ -4278,6 +4318,7 @@ function updateVentures(){
       }
     }
     t.revenue = Math.max(t.revenue, 1e6);
+    applyVentureScaleSafety(v);
   });
 
   // 経営会議の期限切れは消極的選択で自動解決する
@@ -7160,6 +7201,34 @@ function renderVentureModal(ventureId){
       </div>
 
       <div style="height:14px;"></div>
+      <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>追加出資</h2><span class="sub">企業の現金 ${fmtYen(v.cashBalance||0)}</span></div>
+      <div style="padding:10px 0;">
+        <div style="font-size:10.5px; color:var(--muted); line-height:1.6; margin-bottom:8px; font-family:var(--font-wide);">自己資金を直接この企業に注入します。業績不振の企業は自力での資金確保が難しいため、新規事業への投資などはここからの出資が頼りになります。</div>
+        <div class="price-input-row"><label>出資額</label><input type="number" id="inject-capital-amount" value="1000000000" step="100000000"></div>
+        <button class="btn btn-cyan btn-block btn-sm" id="btn-inject-capital" style="margin-top:8px;">出資する</button>
+      </div>
+
+      <div style="height:14px;"></div>
+      <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>新規事業開拓</h2></div>
+      <div style="padding:10px 0;">
+        ${(v.newBusinesses||[]).length ? (v.newBusinesses||[]).map(biz=>{
+          const sector = NEW_BUSINESS_SECTORS.find(s=>s.key===biz.sectorKey);
+          return `<div class="row" style="cursor:default; flex-direction:column; align-items:flex-start; padding:8px 0;">
+            <div class="nm" style="font-size:12px;">${sector?sector.label:biz.label} <span class="badge ${biz.stage==='failed'?'loss':(biz.stage==='growth'||biz.stage==='mature'?'gain':'neutral')}">${NEW_BUSINESS_STAGE_LABELS[biz.stage]||biz.stage}</span></div>
+            <div class="sub">累計投資 ${fmtYen(biz.cumulativeInvestment)} ${biz.stage!=='failed' ? `・売上 ${fmtYen(biz.revenue||0)} ・利益 ${fmtYen(biz.profit||0)}` : ''}</div>
+            ${biz.stage!=='failed' && biz.stage!=='growth' && biz.stage!=='mature' ? `<button class="btn btn-ghost btn-sm" style="margin-top:6px;" data-invest-newbiz="${biz.id}">追加投資する(¥5億)</button>` : ''}
+          </div>`;
+        }).join("") : `<div class="empty-state">まだ新規事業を開拓していません</div>`}
+        <div style="height:10px;"></div>
+        <div style="font-size:10.5px; color:var(--muted); margin-bottom:6px; font-family:var(--font-wide);">新しい事業分野へ参入する(企業の現金から投資額を支出します)</div>
+        <div class="price-input-row"><label>投資額</label><input type="number" id="new-biz-amount" value="3000000000" step="100000000"></div>
+        <select id="new-biz-sector" style="width:100%; margin-top:8px; background:var(--panel-alt); border:1px solid var(--line); color:var(--text); padding:8px; font-family:var(--font);">
+          ${NEW_BUSINESS_SECTORS.map(s=>`<option value="${s.key}">${s.label}</option>`).join("")}
+        </select>
+        <button class="btn btn-red btn-block btn-sm" id="btn-start-new-business" style="margin-top:8px;">この分野へ参入する</button>
+      </div>
+
+      <div style="height:14px;"></div>
       ${v.stage==="private" ? `
       <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>IPO審査基準</h2></div>
       <table class="dtable">
@@ -7189,6 +7258,26 @@ function renderVentureModal(ventureId){
   modal.querySelectorAll('[data-policy]').forEach(b=>{ b.onclick=()=>{ setVenturePolicy(v.id, b.dataset.policy); renderVentureModal(ventureId); }; });
   modal.querySelectorAll('[data-invest]').forEach(b=>{
     b.onclick = ()=>{ const r=investInVenture(v.id, b.dataset.invest); toast(r.msg); renderVentureModal(ventureId); render(); };
+  });
+  const injectBtn = modal.querySelector('#btn-inject-capital');
+  if(injectBtn) injectBtn.onclick = ()=>{
+    const amountInput = modal.querySelector('#inject-capital-amount');
+    const amount = parseInt(amountInput.value)||0;
+    const r = injectCapitalIntoVenture(v.id, amount);
+    toast(r.msg); renderVentureModal(ventureId); render();
+  };
+  const startBizBtn = modal.querySelector('#btn-start-new-business');
+  if(startBizBtn) startBizBtn.onclick = ()=>{
+    const amount = parseInt(modal.querySelector('#new-biz-amount').value)||0;
+    const sectorKey = modal.querySelector('#new-biz-sector').value;
+    const r = startNewBusiness(v.id, sectorKey, amount);
+    toast(r.msg); renderVentureModal(ventureId); render();
+  };
+  modal.querySelectorAll('[data-invest-newbiz]').forEach(b=>{
+    b.onclick = ()=>{
+      const r = investInNewBusiness(v.id, b.dataset.investNewbiz, 500_000_000);
+      toast(r.msg); renderVentureModal(ventureId); render();
+    };
   });
   modal.querySelectorAll('[data-hire-exec]').forEach(b=>{
     b.onclick = ()=>{ const [pos,subtype]=b.dataset.hireExec.split(":"); const r=hireExecutive(v.id,pos,subtype); toast(r.msg); renderVentureModal(ventureId); render(); };
