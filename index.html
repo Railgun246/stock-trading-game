@@ -801,9 +801,7 @@ function getTickSize(price){
    ========================================================================== */
 const GOAL = 1_000_000_000_000;
 const MILESTONES = [
-  {amount:1_000_000,        label:"個人投資家",         desc:"資本金100万円で会社を設立した。"},
-  {amount:5_000_000,        label:"駆け出しの経営者",   desc:"純資産500万円。投資信託設立の条件に近づいてきた。"},
-  {amount:10_000_000,       label:"小規模投資会社",     desc:"純資産1,000万円を突破。従業員を増やしていこう。"},
+  {amount:10_000_000,       label:"個人投資家",         desc:"資本金1,000万円で会社を設立した。"},
   {amount:50_000_000,       label:"新興ブティックファーム", desc:"純資産5,000万円。AI研究部の新設も視野に入る。"},
   {amount:100_000_000,      label:"中堅投資会社",       desc:"運用資産1億円を突破した。"},
   {amount:500_000_000,      label:"地域大手投資会社",   desc:"運用資産5億円。事業の基盤が固まってきた。"},
@@ -930,10 +928,13 @@ function startPeriodicAutosave(){
   periodicAutosaveTimer = setInterval(()=>{ saveState(); }, 45000); // 45秒ごとの定期バックアップ保存(イベント駆動の自動保存に加えた保険)
 }
 let lastBackupTime = 0;
+let suppressAutoSave = false; // オフライン・キャッチアップ中に毎日の自動保存を抑制し、最後に1回だけ保存するためのフラグ
 async function saveState(){
+  if(suppressAutoSave) return;
   try{
     if(state.saveDataVersion===undefined) state.saveDataVersion = CURRENT_SAVE_VERSION;
     state.lastSavedAt = new Date().toISOString();
+    state.lastWallClockTime = new Date().toISOString(); // オフライン・キャッチアップ計算の基準時刻。プレイ中は保存のたびに更新し、閉じた瞬間の時刻に近づける
     const json = JSON.stringify(state);
     const ok = await storageSet(currentStorageKey(), json);
     if(!ok) console.warn("保存に失敗しました");
@@ -1077,9 +1078,9 @@ function initState(){
     companyName:"キャピタル・パートナーズ",
     day:1,
     foundedDateISO: new Date().toISOString(),
-    cash:1_000_000,
+    cash:10_000_000, // 初期資金1,000万円
     reservedCash:0, // 指値/逆指値の買い注文用に確保している現金
-    netWorthHistory:[1_000_000],
+    netWorthHistory:[10_000_000],
     portfolio:{},
     stocks,
     macro:{economy:55, rate:1.0, inflation:1.5, sentiment:0, overseas:0, fx:0},
@@ -1095,7 +1096,7 @@ function initState(){
     ai:{unlocked:false, level:0},
     fund:{active:false, aum:0, reputation:0},
     news:[
-      {day:1, text:`「キャピタル・パートナーズ」を資本金100万円で設立した。`, stars:5, kind:"confirmed", category:"company", type:"good"},
+      {day:1, text:`「キャピタル・パートナーズ」を資本金1,000万円で設立した。`, stars:5, kind:"confirmed", category:"company", type:"good"},
       {day:1, text:`今月の市場テーマ:「${theme.name}」市場への資金流入 +${theme.flowPct}%(関連セクター:${sectorList})`, stars:5, kind:"confirmed", category:"theme", type:"good"},
     ],
     speed:1,
@@ -1111,11 +1112,14 @@ function initState(){
     rivals: generateRivals(),
     activeTob: null,
     pendingBoardReactions: [],
+    marginAccount: {opened:false, openedDay:null},
+    marginPositions: [],
+    marginCall: null,
     globalCompanies: generateGlobalCompanies(),
     legendaryFeats:{tenbagger:false, oku100:false, oku1000:false, ipoSuccess:false, worldClassCompany:false, marketDominator:false},
     pendingCelebrations:[],
     investorXP:0, investorLevel:1,
-    stats:{ realizedProfit:0, realizedLoss:0, totalTrades:0, winTrades:0, ipoProfit:0, ipoLoss:0, maxDrawdown:0, peakNetWorth:1_000_000, tenBaggers:0, fiveBaggers:0 },
+    stats:{ realizedProfit:0, realizedLoss:0, totalTrades:0, winTrades:0, ipoProfit:0, ipoLoss:0, maxDrawdown:0, peakNetWorth:10_000_000, tenBaggers:0, fiveBaggers:0 },
     discoveries:[],
     investmentTheme:null,
     scoutReports:[], lastScoutDay:0,
@@ -1809,6 +1813,229 @@ function marketSlippage(st, qty){
   const raw = clamp(qty/(avgVol*0.05), 0, 0.025) * sizeFactor;
   return raw * (1 - state.departments.trading.level*0.15 - bestRiskLevel()*0.03);
 }
+
+/* ==========================================================================
+   信用取引(信用買い・信用売り/空売り)。現物取引とは独立したシステムとして実装する。
+   委託保証金・建玉・保証金維持率・追証・金利・貸株料・強制決済・踏み上げを再現する。
+   ========================================================================== */
+const MARGIN_REQUIREMENT_RATE = 0.33; // 委託保証金率(取引額の約33%、実際の信用取引の最低水準に近い設定)
+const MARGIN_CALL_THRESHOLD = 20; // 保証金維持率がこれ(%)を下回ると追証
+const MARGIN_SAFE_THRESHOLD = 30; // これ以上で安全
+const MARGIN_WARN_THRESHOLD = 25; // これを下回ると注意
+const MARGIN_CALL_DEADLINE_DAYS = 3;
+
+function canOpenMarginAccount(){
+  const reasons = [];
+  if(state.marginAccount && state.marginAccount.opened) reasons.push("すでに信用取引口座を開設しています");
+  if(state.investorLevel<10) reasons.push("投資家レベル10以上が必要です");
+  if(netWorth()<3_000_000) reasons.push("総資産300万円以上が必要です");
+  if((state.stats.totalTrades||0)<10) reasons.push("現物取引の経験(10回以上の取引)が必要です");
+  return {ok:reasons.length===0, reasons};
+}
+function openMarginAccount(){
+  const check = canOpenMarginAccount();
+  if(!check.ok) return {ok:false, msg:check.reasons.join(" / ")};
+  state.marginAccount = {opened:true, openedDay:state.day};
+  pushNews("信用取引口座を開設した。信用買い・空売りが可能になった。", {stars:3, kind:"confirmed", category:"company", type:"good"});
+  saveState();
+  return {ok:true, msg:"信用取引口座を開設しました"};
+}
+// 銘柄ごとの信用取引・貸借銘柄としての適格性(小型株・新規上場株は対象外とする)
+function isMarginEligible(st){ return st.shares>=2_000_000 && (st.listedDay<=1 || (state.day-st.listedDay)>=60); }
+function isShortSellEligible(st){ return isMarginEligible(st) && st.shares>=4_000_000 && !st.shortSaleRestricted; }
+
+function marginBuy(stockId, qty){
+  if(!state.marginAccount || !state.marginAccount.opened) return {ok:false, msg:"信用取引口座が未開設です"};
+  const st = state.stocks.find(s=>s.id===stockId);
+  if(!st) return {ok:false, msg:"銘柄が見つかりません"};
+  if(!isMarginEligible(st)) return {ok:false, msg:"この銘柄は信用取引の対象外です"};
+  const qv = validateOrderQty(stockId, "buy", qty);
+  if(!qv.ok) return qv;
+  const fillable = computeFillableQty(st, qty);
+  if(fillable<=0) return {ok:false, msg:"市場の流動性不足により約定しませんでした"};
+  const execPrice = st.price*(1+marketSlippage(st, fillable));
+  const positionValue = execPrice*fillable;
+  const requiredMargin = positionValue*MARGIN_REQUIREMENT_RATE;
+  if(availableCash()<requiredMargin) return {ok:false, msg:"委託保証金が不足しています"};
+  state.cash -= requiredMargin;
+  const status = fillable>=qty ? "filled" : "partial";
+  const pos = {id:"mp"+Date.now()+randInt(0,999), stockId, side:"long", qty:fillable, entryPrice:execPrice, entryDay:state.day, marginUsed:requiredMargin, accruedInterest:0, accruedBorrowFee:0};
+  state.marginPositions.push(pos);
+  st.playerNetDemand = (st.playerNetDemand||0) + fillable;
+  state.orderHistory.unshift({day:state.day, type:"margin_buy", orderType:"信用買い", stockId, name:st.name, qty:fillable, requestedQty:qty, status, price:execPrice, total:requiredMargin});
+  if(state.orderHistory.length>80) state.orderHistory.pop();
+  saveState();
+  const statusMsg = status==="partial" ? `(一部約定:希望${fmtNum(qty)}株中${fmtNum(fillable)}株のみ)` : "";
+  return {ok:true, msg:`信用買い成立:${st.name} ${fmtNum(fillable)}株(委託保証金 ${fmtYen(requiredMargin)})${statusMsg}`, filled:fillable, status};
+}
+function shortSell(stockId, qty){
+  if(!state.marginAccount || !state.marginAccount.opened) return {ok:false, msg:"信用取引口座が未開設です"};
+  const st = state.stocks.find(s=>s.id===stockId);
+  if(!st) return {ok:false, msg:"銘柄が見つかりません"};
+  if(!isShortSellEligible(st)) return {ok:false, msg:"この銘柄は空売りの対象外です(貸借銘柄でない、または品貸料規制中)"};
+  if(!qty || qty<=0 || qty%TRADING_UNIT!==0) return {ok:false, msg:`空売りは${TRADING_UNIT}株単位で入力してください`};
+  const fillable = computeFillableQty(st, qty);
+  if(fillable<=0) return {ok:false, msg:"市場の流動性不足により約定しませんでした"};
+  const execPrice = st.price*(1-marketSlippage(st, fillable));
+  const positionValue = execPrice*fillable;
+  const requiredMargin = positionValue*MARGIN_REQUIREMENT_RATE;
+  if(availableCash()<requiredMargin) return {ok:false, msg:"委託保証金が不足しています"};
+  state.cash -= requiredMargin;
+  const status = fillable>=qty ? "filled" : "partial";
+  const pos = {id:"mp"+Date.now()+randInt(0,999), stockId, side:"short", qty:fillable, entryPrice:execPrice, entryDay:state.day, marginUsed:requiredMargin, accruedInterest:0, accruedBorrowFee:0};
+  state.marginPositions.push(pos);
+  st.playerNetDemand = (st.playerNetDemand||0) - fillable;
+  state.orderHistory.unshift({day:state.day, type:"short_sell", orderType:"信用売り(空売り)", stockId, name:st.name, qty:fillable, requestedQty:qty, status, price:execPrice, total:requiredMargin});
+  if(state.orderHistory.length>80) state.orderHistory.pop();
+  saveState();
+  const statusMsg = status==="partial" ? `(一部約定:希望${fmtNum(qty)}株中${fmtNum(fillable)}株のみ)` : "";
+  return {ok:true, msg:`信用売り(空売り)成立:${st.name} ${fmtNum(fillable)}株(委託保証金 ${fmtYen(requiredMargin)})${statusMsg}`, filled:fillable, status};
+}
+// 返済売り(信用買いの決済)/返済買い(空売りの決済)。どちらもこの関数で扱う(pos.sideで自動判定)
+function closeMarginPosition(positionId, qty){
+  const pos = state.marginPositions.find(p=>p.id===positionId);
+  if(!pos) return {ok:false, msg:"建玉が見つかりません"};
+  const st = state.stocks.find(s=>s.id===pos.stockId);
+  if(!st) return {ok:false, msg:"銘柄が見つかりません"};
+  const closeQty = Math.min(qty, pos.qty);
+  const fillable = computeFillableQty(st, closeQty);
+  if(fillable<=0) return {ok:false, msg:"市場の流動性不足により決済できませんでした"};
+  const ratio = fillable/pos.qty;
+
+  let execPrice, pnl;
+  if(pos.side==="long"){
+    execPrice = st.price*(1-marketSlippage(st, fillable));
+    pnl = (execPrice-pos.entryPrice)*fillable;
+    st.playerNetDemand = (st.playerNetDemand||0) - fillable;
+  } else {
+    execPrice = st.price*(1+marketSlippage(st, fillable));
+    pnl = (pos.entryPrice-execPrice)*fillable;
+    st.playerNetDemand = (st.playerNetDemand||0) + fillable;
+  }
+  const marginReturned = pos.marginUsed*ratio;
+  const costs = pos.accruedInterest*ratio + pos.accruedBorrowFee*ratio;
+  state.cash += marginReturned + pnl - costs;
+  state.pendingRealizedPL += pnl - costs;
+  recordTradeStats(pnl-costs, st.name);
+
+  pos.marginUsed -= marginReturned;
+  pos.accruedInterest -= pos.accruedInterest*ratio;
+  pos.accruedBorrowFee -= pos.accruedBorrowFee*ratio;
+  pos.qty -= fillable;
+  if(pos.qty<=0) state.marginPositions = state.marginPositions.filter(p=>p.id!==positionId);
+  state.orderHistory.unshift({day:state.day, type: pos.side==="long"?"margin_sell_close":"short_buy_close", orderType: pos.side==="long"?"信用返済売り":"信用返済買い", stockId:pos.stockId, name:st.name, qty:fillable, requestedQty:qty, status: fillable>=qty?"filled":"partial", price:execPrice, total:pnl-costs});
+  if(state.orderHistory.length>80) state.orderHistory.pop();
+  saveState();
+  return {ok:true, msg:`決済完了:${st.name} ${fmtNum(fillable)}株、損益${pnl-costs>=0?'+':''}${fmtYen(pnl-costs)}`, pnl:pnl-costs};
+}
+// 保証金維持率をリアルタイムで計算する
+function computeMaintenanceRatio(){
+  if(!state.marginPositions.length) return null;
+  let totalMargin=0, totalPositionValue=0, totalUnrealizedPL=0, totalCosts=0;
+  state.marginPositions.forEach(pos=>{
+    const st = state.stocks.find(s=>s.id===pos.stockId);
+    if(!st) return;
+    totalMargin += pos.marginUsed;
+    totalPositionValue += st.price*pos.qty;
+    totalUnrealizedPL += pos.side==="long" ? (st.price-pos.entryPrice)*pos.qty : (pos.entryPrice-st.price)*pos.qty;
+    totalCosts += pos.accruedInterest + pos.accruedBorrowFee;
+  });
+  if(totalPositionValue<=0) return null;
+  const ratio = (totalMargin+totalUnrealizedPL-totalCosts)/totalPositionValue*100;
+  return {ratio, totalMargin, totalPositionValue, totalUnrealizedPL, totalCosts};
+}
+function marginRatioStatusLabel(ratio){
+  if(ratio>=MARGIN_SAFE_THRESHOLD) return "安全";
+  if(ratio>=MARGIN_WARN_THRESHOLD) return "注意";
+  if(ratio>=MARGIN_CALL_THRESHOLD) return "追証警告";
+  return "追証";
+}
+function checkMarginCall(){
+  const m = computeMaintenanceRatio();
+  if(!m){ state.marginCall=null; return; }
+  if(m.ratio < MARGIN_CALL_THRESHOLD){
+    if(!state.marginCall){
+      const shortfall = Math.round((MARGIN_CALL_THRESHOLD - m.ratio)/100 * m.totalPositionValue);
+      state.marginCall = {triggeredDay:state.day, deadline:state.day+MARGIN_CALL_DEADLINE_DAYS, shortfall};
+      pushNews(`【追証発生】保証金維持率が${m.ratio.toFixed(1)}%まで低下しました。${MARGIN_CALL_DEADLINE_DAYS}日以内に${fmtYen(shortfall)}相当の保証金を追加するか、ポジションを減らしてください。`, {stars:5, kind:"confirmed", category:"margin", type:"event"});
+    }
+  } else if(state.marginCall){
+    pushNews("保証金維持率が回復し、追証は解消されました。", {stars:3, kind:"confirmed", category:"margin", type:"good"});
+    state.marginCall = null;
+  }
+}
+function addMarginCollateral(amount){
+  if(!state.marginCall) return {ok:false, msg:"現在追証は発生していません"};
+  if(availableCash()<amount) return {ok:false, msg:"資金が不足しています"};
+  state.cash -= amount;
+  const totalMarginUsed = state.marginPositions.reduce((s,p)=>s+p.marginUsed,0)||1;
+  state.marginPositions.forEach(p=>{ p.marginUsed += amount*(p.marginUsed/totalMarginUsed); });
+  checkMarginCall();
+  saveState();
+  return {ok:true, msg:`保証金${fmtYen(amount)}を追加しました`};
+}
+// 追証未解消時の強制決済(評価損が大きいポジションから順に。パニック的な相場を想定し、通常より大きなスリッページを適用する)
+function closeMarginPositionForced(positionId){
+  const pos = state.marginPositions.find(p=>p.id===positionId);
+  if(!pos) return;
+  const st = state.stocks.find(s=>s.id===pos.stockId);
+  if(!st){ state.marginPositions = state.marginPositions.filter(p=>p.id!==positionId); return; }
+  const panicSlip = marketSlippage(st, pos.qty)*2.5;
+  let execPrice, pnl;
+  if(pos.side==="long"){ execPrice = st.price*(1-panicSlip); pnl=(execPrice-pos.entryPrice)*pos.qty; st.playerNetDemand=(st.playerNetDemand||0)-pos.qty; }
+  else { execPrice = st.price*(1+panicSlip); pnl=(pos.entryPrice-execPrice)*pos.qty; st.playerNetDemand=(st.playerNetDemand||0)+pos.qty; }
+  const costs = pos.accruedInterest+pos.accruedBorrowFee;
+  state.cash += pos.marginUsed + pnl - costs;
+  state.pendingRealizedPL += pnl - costs;
+  recordTradeStats(pnl-costs, st.name);
+  state.marginPositions = state.marginPositions.filter(p=>p.id!==positionId);
+}
+function resolveOverdueMarginCall(){
+  if(!state.marginCall) return;
+  if(state.day < state.marginCall.deadline) return;
+  pushNews("【強制決済】追証が解消されなかったため、信用建玉を強制的に決済しました。", {stars:5, kind:"confirmed", category:"margin", type:"event"});
+  const sortedIds = [...state.marginPositions].sort((a,b)=>{
+    const stA=state.stocks.find(s=>s.id===a.stockId), stB=state.stocks.find(s=>s.id===b.stockId);
+    const plA = stA ? (a.side==='long'?(stA.price-a.entryPrice)*a.qty:(a.entryPrice-stA.price)*a.qty) : 0;
+    const plB = stB ? (b.side==='long'?(stB.price-b.entryPrice)*b.qty:(b.entryPrice-stB.price)*b.qty) : 0;
+    return plA-plB;
+  }).map(p=>p.id);
+  for(const id of sortedIds){
+    const m = computeMaintenanceRatio();
+    if(!m || m.ratio>=MARGIN_CALL_THRESHOLD*1.3) break;
+    closeMarginPositionForced(id);
+  }
+  state.marginCall = null;
+  saveState();
+}
+// 信用建玉の日次コスト(信用買い金利・空売り貸株料)を計上する。金利は市場金利に連動し、貸株料は空売り人気度で上昇する
+function updateMarginPositions(){
+  if(!state.marginAccount || !state.marginAccount.opened || !state.marginPositions.length) return;
+  const dailyRate = (state.macro.rate+1.5)/100/365;
+  const dailyBorrowBaseRate = 1.1/100/365;
+  state.marginPositions.forEach(pos=>{
+    const st = state.stocks.find(s=>s.id===pos.stockId);
+    if(!st) return;
+    const notional = pos.marginUsed/MARGIN_REQUIREMENT_RATE;
+    if(pos.side==="long"){
+      pos.accruedInterest += notional*dailyRate;
+    } else {
+      const shortInterestRatio = clamp((st.marginSellOutstanding||0)/floatShares(st), 0, 3);
+      const popularityPremium = clamp(shortInterestRatio*0.02, 0, 0.05);
+      pos.accruedBorrowFee += notional*(dailyBorrowBaseRate+popularityPremium/365);
+    }
+  });
+  checkMarginCall();
+  resolveOverdueMarginCall();
+}
+// 踏み上げ(ショートスクイーズ): 空売り比率が高い銘柄が好材料に見舞われると、買い戻しにより上昇圧力が増幅される
+function shortSqueezeBoost(st){
+  if(!isShortSellEligible(st)) return 0;
+  const shortRatio = clamp((st.marginSellOutstanding||0)/floatShares(st), 0, 3);
+  if(shortRatio<0.15) return 0;
+  return clamp(shortRatio*0.08, 0, 0.25);
+}
+
 function buyStock(stockId, qty){
   const st = state.stocks.find(s=>s.id===stockId);
   if(!st) return {ok:false, msg:"銘柄が見つかりません"};
@@ -1888,97 +2115,258 @@ function sellStock(stockId, qty){
 }
 
 // 指値/逆指値/OCO注文の発注
+// 注文種別の表示ラベル
+const ORDER_TYPE_LABELS = {market:"成行", limit:"指値", stop:"逆指値", oco:"OCO"};
 function placeOrder(params){
-  const {stockId, side, orderType, qty, limitPrice, stopPrice, ocoLimitPrice, ocoStopPrice, validityDays} = params;
+  const {stockId, side, orderType, qty, limitPrice, stopPrice, ocoLimitPrice, ocoStopPrice, validityDays, tradeCategory, marginAction, positionId} = params;
   const st = state.stocks.find(s=>s.id===stockId);
   if(!st) return {ok:false, msg:"銘柄が見つかりません"};
-  const qv = validateOrderQty(stockId, side, qty);
-  if(!qv.ok) return qv;
+  const category = tradeCategory||"spot"; // "spot" | "margin"
+  const action = marginAction||null; // "open" | "close" (信用取引のみ)
+
+  if(category==="margin"){
+    if(!state.marginAccount || !state.marginAccount.opened) return {ok:false, msg:"信用取引口座が未開設です"};
+    if(action==="open" && !isMarginEligible(st)) return {ok:false, msg:"この銘柄は信用取引の対象外です"};
+    if(action==="open" && side==="sell" && !isShortSellEligible(st)) return {ok:false, msg:"この銘柄は空売りの対象外です"};
+    if(!qty || qty<=0 || qty%TRADING_UNIT!==0) return {ok:false, msg:`${TRADING_UNIT}株単位で入力してください`};
+  } else {
+    const qv = validateOrderQty(stockId, side, qty);
+    if(!qv.ok) return qv;
+  }
   if(orderType==="limit" && !canUseLimitOrders()) return {ok:false, msg:"トレード部を設立すると指値注文が利用できます"};
   if(orderType==="stop" && !canUseStopOrders()) return {ok:false, msg:"トレード部Lv.3で逆指値注文が解禁されます"};
   if(orderType==="oco" && !canUseOCOOrders()) return {ok:false, msg:"トレード部Lv.4でOCO注文が解禁されます"};
 
-  const order = { id:"o"+Date.now()+randInt(0,9999), stockId, side, orderType, qty, createdDay:state.day, validityDays: validityDays||30, status:"pending", reservedAmount:0 };
+  const order = { id:"o"+Date.now()+randInt(0,9999), stockId, side, orderType, qty, filledQty:0, createdDay:state.day, validityDays: validityDays||30, status:"pending", reservedAmount:0, tradeCategory:category, marginAction:action, positionId:positionId||null };
 
   if(orderType==="limit") order.limitPrice = limitPrice;
   if(orderType==="stop") order.stopPrice = stopPrice;
   if(orderType==="oco"){
     if(side!=="sell") return {ok:false, msg:"OCO注文は保有株の利確/損切り設定(売り)専用です"};
+    if(category==="margin") return {ok:false, msg:"OCO注文は現物取引のみ対応しています"};
     order.limitPrice = ocoLimitPrice; order.stopPrice = ocoStopPrice;
   }
 
-  if(side==="buy"){
-
+  if(action==="close"){
+    // 信用返済(売/買): 対象建玉の存在と数量を確認する
+    const pos = state.marginPositions.find(p=>p.id===positionId);
+    if(!pos) return {ok:false, msg:"対象の建玉が見つかりません"};
+    if(qty>pos.qty) return {ok:false, msg:"建玉の数量を超えています"};
+    if(orderType==="limit" && (!limitPrice||limitPrice<=0)) return {ok:false, msg:"価格を入力してください"};
+    if(orderType==="stop" && (!stopPrice||stopPrice<=0)) return {ok:false, msg:"価格を入力してください"};
+  } else if(side==="buy"){
     const refPrice = orderType==="limit" ? limitPrice : stopPrice;
     if(!refPrice || refPrice<=0) return {ok:false, msg:"価格を入力してください"};
-    const estCost = refPrice*qty*(1+feeRate());
-    if(availableCash() < estCost) return {ok:false, msg:"利用可能な資金が不足しています"};
+    const estCost = category==="margin" ? refPrice*qty*MARGIN_REQUIREMENT_RATE : refPrice*qty*(1+feeRate());
+    if(availableCash() < estCost) return {ok:false, msg: category==="margin" ? "委託保証金が不足しています" : "利用可能な資金が不足しています"};
     order.reservedAmount = estCost;
     state.reservedCash += estCost;
   } else {
-    const maxQty = availableShares(stockId);
-    if(qty>maxQty) return {ok:false, msg:"売却可能な株数を超えています(他の注文分を除く)"};
+    // 信用新規売(空売り)の新規建て
     if(orderType==="limit" && (!limitPrice||limitPrice<=0)) return {ok:false, msg:"価格を入力してください"};
     if(orderType==="stop" && (!stopPrice||stopPrice<=0)) return {ok:false, msg:"価格を入力してください"};
-    if(orderType==="oco" && (!ocoLimitPrice||!ocoStopPrice)) return {ok:false, msg:"利確・損切りの両方の価格を入力してください"};
+    if(category==="margin"){
+      const refPrice = orderType==="limit" ? limitPrice : stopPrice;
+      const estMargin = refPrice*qty*MARGIN_REQUIREMENT_RATE;
+      if(availableCash() < estMargin) return {ok:false, msg:"委託保証金が不足しています"};
+      order.reservedAmount = estMargin;
+      state.reservedCash += estMargin;
+    } else {
+      const maxQty = availableShares(stockId);
+      if(qty>maxQty) return {ok:false, msg:"売却可能な株数を超えています(他の注文分を除く)"};
+      if(orderType==="oco" && (!ocoLimitPrice||!ocoStopPrice)) return {ok:false, msg:"利確・損切りの両方の価格を入力してください"};
+    }
   }
 
   state.pendingOrders.push(order);
   saveState();
   return {ok:true, msg:"注文を発注しました", orderId:order.id};
 }
+// 未約定・一部約定の注文について、指値・逆指値価格や数量を変更する(取消して出し直すのではなく、同一注文として更新する)
+function modifyOrder(orderId, changes){
+  const order = state.pendingOrders.find(o=>o.id===orderId);
+  if(!order) return {ok:false, msg:"注文が見つかりません"};
+  if(order.status!=="pending") return {ok:false, msg:"約定済み・取消済みの注文は変更できません"};
+  const st = state.stocks.find(s=>s.id===order.stockId);
+  if(!st) return {ok:false, msg:"銘柄が見つかりません"};
+  const remaining = order.qty - (order.filledQty||0);
+  const newQty = changes.qty!==undefined ? changes.qty : order.qty;
+  if(newQty <= (order.filledQty||0)) return {ok:false, msg:"数量は約定済み数量より多く指定してください"};
+  if(newQty%TRADING_UNIT!==0) return {ok:false, msg:`${TRADING_UNIT}株単位で入力してください`};
+
+  // 売り注文の場合、保有数量・信用建玉数量の超過チェック
+  if(order.side==="sell" && order.marginAction!=="close" && order.tradeCategory==="spot"){
+    const maxQty = availableShares(order.stockId) + remaining; // 自分自身の未約定分は制約から除外する
+    if(newQty-(order.filledQty||0) > maxQty) return {ok:false, msg:"売却可能な株数を超えています"};
+  }
+  if(order.marginAction==="close"){
+    const pos = state.marginPositions.find(p=>p.id===order.positionId);
+    if(pos && (newQty-(order.filledQty||0))>pos.qty) return {ok:false, msg:"建玉の数量を超えています"};
+  }
+
+  const newLimitPrice = changes.limitPrice!==undefined ? changes.limitPrice : order.limitPrice;
+  const newStopPrice = changes.stopPrice!==undefined ? changes.stopPrice : order.stopPrice;
+
+  // 資金拘束の再計算(買い注文・空売り新規建てのみ、価格・数量変更に応じて確保額を調整する)
+  if(order.marginAction!=="close"){
+    const refPrice = order.orderType==="limit" ? newLimitPrice : newStopPrice;
+    if(order.side==="buy" || (order.side==="sell" && order.tradeCategory==="margin")){
+      const rate = order.tradeCategory==="margin" ? MARGIN_REQUIREMENT_RATE : (1+feeRate());
+      const newRemaining = newQty-(order.filledQty||0);
+      const newReserved = refPrice*newRemaining*rate;
+      if(availableCash()+order.reservedAmount < newReserved) return {ok:false, msg:"変更後の注文に必要な資金が不足しています"};
+      state.reservedCash = Math.max(0, state.reservedCash-order.reservedAmount+newReserved);
+      order.reservedAmount = newReserved;
+    }
+  }
+
+  order.qty = newQty;
+  if(order.orderType==="limit") order.limitPrice = newLimitPrice;
+  if(order.orderType==="stop") order.stopPrice = newStopPrice;
+  if(order.orderType==="oco"){
+    if(changes.ocoLimitPrice!==undefined) order.limitPrice = changes.ocoLimitPrice;
+    if(changes.ocoStopPrice!==undefined) order.stopPrice = changes.ocoStopPrice;
+  }
+  order.modifiedDay = state.day;
+  saveState();
+  return {ok:true, msg:"注文を変更しました"};
+}
+
 function cancelOrder(orderId){
   const order = state.pendingOrders.find(o=>o.id===orderId);
   if(!order) return {ok:false, msg:"注文が見つかりません"};
-  if(order.side==="buy") state.reservedCash = Math.max(0, state.reservedCash-order.reservedAmount);
-  state.pendingOrders = state.pendingOrders.filter(o=>o.id!==orderId);
+  if(order.status!=="pending") return {ok:false, msg:"すでに約定・取消済みの注文です"};
+  if(order.side==="buy" || (order.side==="sell" && order.tradeCategory==="margin" && order.marginAction==="open")){
+    state.reservedCash = Math.max(0, state.reservedCash-order.reservedAmount);
+  }
+  order.status = "cancelled";
+  order.cancelledDay = state.day;
   saveState();
   return {ok:true, msg:"注文をキャンセルしました"};
 }
-// 1日分の株価が確定した後、条件を満たす注文を約定させる(日中高安値を使って判定)
+// 1日分の株価が確定した後、条件を満たす注文を約定させる(日中高安値を使って判定)。
+// 現物・信用(新規/返済)すべてこの関数で扱う。出来高に対して大きい注文は一部約定になる(市場の板・約定システムと共通の仕組みを使う)
 function processPendingOrders(st){
   const today = todayCandle(st);
   const related = state.pendingOrders.filter(o=>o.stockId===st.id && o.status==="pending");
   if(!related.length) return;
 
   const fillOrder = (order, execPrice)=>{
+    const remaining = order.qty - (order.filledQty||0);
+    if(remaining<=0){ order.status="filled"; return; }
+    const fillable = computeFillableQty(st, remaining);
+    if(fillable<=0) return;
+    const isOpen = order.tradeCategory==="margin" && order.marginAction==="open";
+    const isClose = order.tradeCategory==="margin" && order.marginAction==="close";
+    let recordTotal = 0;
+
     if(order.side==="buy"){
-      if(today.stopHigh) return false;
-      const cost = execPrice*order.qty;
-      const fee = cost*feeRate();
-      state.reservedCash = Math.max(0, state.reservedCash-order.reservedAmount);
-      state.cash -= (cost+fee);
-      const pos = state.portfolio[st.id] || {shares:0, avgCost:0};
-      const newShares = pos.shares+order.qty;
-      pos.avgCost = (pos.avgCost*pos.shares+cost)/newShares;
-      pos.shares = newShares;
-      state.portfolio[st.id] = pos;
-      state.orderHistory.unshift({day:state.day, type:"buy", orderType: order.orderType==="limit"?"指値":"逆指値", stockId:st.id, name:st.name, qty:order.qty, price:execPrice, total:cost+fee});
+      if(today.stopHigh) return;
+      if(isOpen){
+        const cost = execPrice*fillable;
+        const requiredMargin = cost*MARGIN_REQUIREMENT_RATE;
+        const releaseAmount = order.reservedAmount*(fillable/order.qty);
+        state.reservedCash = Math.max(0, state.reservedCash-releaseAmount);
+        order.reservedAmount -= releaseAmount;
+        state.cash -= requiredMargin;
+        state.marginPositions.push({id:"mp"+Date.now()+randInt(0,999), stockId:st.id, side:"long", qty:fillable, entryPrice:execPrice, entryDay:state.day, marginUsed:requiredMargin, accruedInterest:0, accruedBorrowFee:0});
+        st.playerNetDemand = (st.playerNetDemand||0)+fillable;
+        recordTotal = requiredMargin;
+      } else if(isClose){
+        const pos = state.marginPositions.find(p=>p.id===order.positionId);
+        if(!pos) return;
+        const closeQty = Math.min(fillable, pos.qty);
+        const ratio = closeQty/pos.qty;
+        const pnl = (pos.entryPrice-execPrice)*closeQty;
+        const marginReturned = pos.marginUsed*ratio;
+        const costs = (pos.accruedInterest+pos.accruedBorrowFee)*ratio;
+        state.cash += marginReturned+pnl-costs;
+        state.pendingRealizedPL += pnl-costs;
+        recordTradeStats(pnl-costs, st.name);
+        pos.marginUsed -= marginReturned; pos.accruedInterest -= pos.accruedInterest*ratio; pos.accruedBorrowFee -= pos.accruedBorrowFee*ratio;
+        pos.qty -= closeQty;
+        if(pos.qty<=0) state.marginPositions = state.marginPositions.filter(p=>p.id!==pos.id);
+        st.playerNetDemand = (st.playerNetDemand||0)+closeQty;
+        recordTotal = pnl-costs;
+      } else {
+        const cost = execPrice*fillable;
+        const fee = cost*feeRate();
+        const releaseAmount = order.reservedAmount*(fillable/order.qty);
+        state.reservedCash = Math.max(0, state.reservedCash-releaseAmount);
+        order.reservedAmount -= releaseAmount;
+        state.cash -= (cost+fee);
+        const pos = state.portfolio[st.id] || {shares:0, avgCost:0};
+        const newShares = pos.shares+fillable;
+        pos.avgCost = (pos.avgCost*pos.shares+cost)/newShares;
+        pos.shares = newShares;
+        state.portfolio[st.id] = pos;
+        st.playerNetDemand = (st.playerNetDemand||0)+fillable;
+        recordTotal = cost+fee;
+      }
     } else {
-      if(today.stopLow) return false;
-      const proceeds = execPrice*order.qty;
-      const fee = proceeds*feeRate();
-      const pos = state.portfolio[st.id];
-      if(!pos || pos.shares<order.qty) return false;
-      state.cash += (proceeds-fee);
-      const tradePnl = (execPrice-pos.avgCost)*order.qty - fee;
-      state.pendingRealizedPL += tradePnl;
-      recordTradeStats(tradePnl, st.name);
-      pos.shares -= order.qty;
-      if(pos.shares<=0) delete state.portfolio[st.id];
-      state.orderHistory.unshift({day:state.day, type:"sell", orderType: order.orderType==="limit"?"指値":(order.orderType==="oco"?"OCO":"逆指値"), stockId:st.id, name:st.name, qty:order.qty, price:execPrice, total:proceeds-fee});
+      if(today.stopLow) return;
+      if(isOpen){
+        const proceeds = execPrice*fillable;
+        const requiredMargin = proceeds*MARGIN_REQUIREMENT_RATE;
+        const releaseAmount = order.reservedAmount*(fillable/order.qty);
+        state.reservedCash = Math.max(0, state.reservedCash-releaseAmount);
+        order.reservedAmount -= releaseAmount;
+        state.cash -= requiredMargin;
+        state.marginPositions.push({id:"mp"+Date.now()+randInt(0,999), stockId:st.id, side:"short", qty:fillable, entryPrice:execPrice, entryDay:state.day, marginUsed:requiredMargin, accruedInterest:0, accruedBorrowFee:0});
+        st.playerNetDemand = (st.playerNetDemand||0)-fillable;
+        recordTotal = requiredMargin;
+      } else if(isClose){
+        const pos = state.marginPositions.find(p=>p.id===order.positionId);
+        if(!pos) return;
+        const closeQty = Math.min(fillable, pos.qty);
+        const ratio = closeQty/pos.qty;
+        const pnl = (execPrice-pos.entryPrice)*closeQty;
+        const marginReturned = pos.marginUsed*ratio;
+        const costs = (pos.accruedInterest+pos.accruedBorrowFee)*ratio;
+        state.cash += marginReturned+pnl-costs;
+        state.pendingRealizedPL += pnl-costs;
+        recordTradeStats(pnl-costs, st.name);
+        pos.marginUsed -= marginReturned; pos.accruedInterest -= pos.accruedInterest*ratio; pos.accruedBorrowFee -= pos.accruedBorrowFee*ratio;
+        pos.qty -= closeQty;
+        if(pos.qty<=0) state.marginPositions = state.marginPositions.filter(p=>p.id!==pos.id);
+        st.playerNetDemand = (st.playerNetDemand||0)-closeQty;
+        recordTotal = pnl-costs;
+      } else {
+        const proceeds = execPrice*fillable;
+        const fee = proceeds*feeRate();
+        const pos = state.portfolio[st.id];
+        if(!pos || pos.shares<fillable) return;
+        state.cash += (proceeds-fee);
+        const tradePnl = (execPrice-pos.avgCost)*fillable - fee;
+        state.pendingRealizedPL += tradePnl;
+        recordTradeStats(tradePnl, st.name);
+        pos.shares -= fillable;
+        if(pos.shares<=0) delete state.portfolio[st.id];
+        st.playerNetDemand = (st.playerNetDemand||0)-fillable;
+        recordTotal = proceeds-fee;
+      }
     }
+
+    order.filledQty = (order.filledQty||0)+fillable;
+    order.lastFillDay = state.day;
+    const catLabel = order.tradeCategory==="margin" ? (isOpen ? (order.side==="buy"?"信用新規買":"信用新規売") : (order.side==="buy"?"信用返済買":"信用返済売")) : (order.side==="buy"?"買い":"売り");
+    state.orderHistory.unshift({day:state.day, type: order.side, orderType: ORDER_TYPE_LABELS[order.orderType]||order.orderType, tradeCategory:order.tradeCategory, marginAction:order.marginAction, stockId:st.id, name:st.name, qty:fillable, price:execPrice, total:recordTotal});
     if(state.orderHistory.length>80) state.orderHistory.pop();
-    order.status="filled";
-    pushNews(`【約定】${st.name} ${order.side==="buy"?"買い":"売り"} ${order.qty}株 @¥${fmtNum(execPrice)}`, {stars:1, kind:"confirmed", category:"order", stockId:st.id, type: order.side==="buy"?"good":"flavor"});
-    return true;
+    if(order.filledQty>=order.qty){
+      order.status="filled";
+      pushNews(`【約定】${st.name} ${catLabel} ${order.qty}株 @¥${fmtNum(execPrice)}`, {stars:1, kind:"confirmed", category:"order", stockId:st.id, type: order.side==="buy"?"good":"flavor"});
+    } else {
+      pushNews(`【一部約定】${st.name} ${catLabel} ${fmtNum(fillable)}株(残り${fmtNum(order.qty-order.filledQty)}株) @¥${fmtNum(execPrice)}`, {stars:1, kind:"confirmed", category:"order", stockId:st.id, type:"flavor"});
+    }
   };
 
   related.forEach(order=>{
     if(order.status!=="pending") return;
     // 有効期限切れ
     if(state.day - order.createdDay > order.validityDays){
-      if(order.side==="buy") state.reservedCash = Math.max(0, state.reservedCash-order.reservedAmount);
+      if(order.side==="buy" || (order.side==="sell" && order.tradeCategory==="margin" && order.marginAction==="open")){
+        state.reservedCash = Math.max(0, state.reservedCash-order.reservedAmount);
+      }
       order.status="expired";
       return;
     }
@@ -2000,7 +2388,8 @@ function processPendingOrders(st){
       else if(stopHit){ fillOrder(order, order.stopPrice); }
     }
   });
-  state.pendingOrders = state.pendingOrders.filter(o=>o.status==="pending");
+  // 約定・取消・失効した注文は「注文管理」の履歴として一定期間保持し、古いものだけ間引く(無条件に消さない)
+  state.pendingOrders = state.pendingOrders.filter(o=> o.status==="pending" || (state.day-(o.lastFillDay||o.cancelledDay||o.createdDay))<60);
 }
 
 /* ==========================================================================
@@ -2222,26 +2611,91 @@ function bestPlayerVentureValue(){
 }
 
 // 世界企業時価総額ランキング(架空の海外企業+ゲーム内の日本企業+プレイヤーが育てた企業)
+// 世界企業(理論企業価値ベースで評価する。単純なランダムウォークではなく、日本株側と同等の
+// 「業績→成長率の平均回帰→理論価値への収束」構造を採用し、長期プレイでも天文学的な数値にならないようにする)
 const GLOBAL_COMPANIES = [
-  {name:"Global Tech Holdings", region:"アメリカ", baseCap: 450e12},
-  {name:"Next Future Industries", region:"アメリカ", baseCap: 380e12},
-  {name:"Pinnacle Dynamics Corp", region:"アメリカ", baseCap: 310e12},
-  {name:"Continental Engineering AG", region:"ヨーロッパ", baseCap: 220e12},
-  {name:"Nordic Quantum Systems", region:"ヨーロッパ", baseCap: 150e12},
-  {name:"Zhonghua Innovation Group", region:"中国", baseCap: 280e12},
-  {name:"Dragon Cloud Technologies", region:"中国", baseCap: 190e12},
-  {name:"Bharat Digital Enterprises", region:"インド", baseCap: 130e12},
-  {name:"Mekong Growth Holdings", region:"東南アジア", baseCap: 60e12},
+  {id:"gc1", name:"Global Tech Holdings",       region:"アメリカ",   sector:"テクノロジー", baseRevenue:220e12, baseProfit:42e12, growth:9,  quality:0.72},
+  {id:"gc2", name:"Next Future Industries",     region:"アメリカ",   sector:"テクノロジー", baseRevenue:190e12, baseProfit:34e12, growth:8,  quality:0.68},
+  {id:"gc3", name:"Pinnacle Dynamics Corp",     region:"アメリカ",   sector:"製造業",       baseRevenue:160e12, baseProfit:26e12, growth:5,  quality:0.60},
+  {id:"gc4", name:"Continental Engineering AG", region:"ヨーロッパ", sector:"素材",         baseRevenue:120e12, baseProfit:16e12, growth:3,  quality:0.55},
+  {id:"gc5", name:"Nordic Quantum Systems",     region:"ヨーロッパ", sector:"次世代技術",   baseRevenue:60e12,  baseProfit:11e12, growth:12, quality:0.65},
+  {id:"gc6", name:"Zhonghua Innovation Group",  region:"中国",       sector:"IT",           baseRevenue:150e12, baseProfit:24e12, growth:10, quality:0.62},
+  {id:"gc7", name:"Dragon Cloud Technologies",  region:"中国",       sector:"AI",           baseRevenue:90e12,  baseProfit:15e12, growth:14, quality:0.63},
+  {id:"gc8", name:"Bharat Digital Enterprises", region:"インド",     sector:"IT",           baseRevenue:55e12,  baseProfit:8e12,  growth:16, quality:0.58},
+  {id:"gc9", name:"Mekong Growth Holdings",     region:"東南アジア", sector:"金融",         baseRevenue:20e12,  baseProfit:3e12,  growth:13, quality:0.50},
 ];
-function generateGlobalCompanies(){
-  return GLOBAL_COMPANIES.map(g=>({...g, capCurrent:g.baseCap}));
+const GLOBAL_COMPANY_SECTORS = ["AI","半導体","宇宙","防衛","EV","ロボット","バイオ","エネルギー","金融","IT","食品","小売","素材","医療","次世代技術"];
+const GLOBAL_COMPANY_NAME_PARTS = {base:["Nova","Apex","Vertex","Quantum","Horizon","Titan","Nexus","Prime","Stellar","Fusion","Orbit","Aurora"], suffix:["Systems","Holdings","Group","Industries","Technologies","Dynamics","Corp","Networks","Labs"]};
+function initGlobalCompanyRuntime(def, bornDay){
+  return {...def, revenue:def.baseRevenue, profit:def.baseProfit, growth:def.growth, quality:def.quality,
+    stage:"growth", bornDay: bornDay||1, deathDay:null, capCurrent: Math.max(1e9, def.baseProfit*computeGlobalPER(def.growth, def.quality))};
 }
+function generateGlobalCompanies(){ return GLOBAL_COMPANIES.map(g=>initGlobalCompanyRuntime(g,1)); }
+function computeGlobalPER(growth, quality){
+  const growthPremium = clamp(growth/100, -0.15, 0.5);
+  const qualityPremium = (quality-0.5)*0.5;
+  return clamp(14*(1+growthPremium+qualityPremium), 4, 40);
+}
+// 理論企業価値(業績×妥当なPER)。実際の時価総額はこの理論値へ緩やかに収束する
+function globalCompanyFairValue(g){ return Math.max(1e9, g.profit*computeGlobalPER(g.growth, g.quality)); }
 function updateGlobalCompanies(){
-  state.globalCompanies.forEach(g=>{ g.capCurrent = Math.max(1e10, g.capCurrent*(1+rand(-0.006,0.008))); });
+  checkNewGlobalCompanyBirth();
+  state.globalCompanies.forEach(g=>{
+    if(g.stage==="dead") return;
+    // 成長率は(日本株と同様に)緩やかに定常成長率へ収束する。巨大企業ほど低成長に落ち着く現実の力学を反映
+    const growthTarget = 3.5;
+    g.growth = clamp(g.growth + rand(-0.35,0.35) + (g.growth-growthTarget)*-0.006, -10, 35);
+    g.quality = clamp(g.quality + rand(-0.004,0.004) + (g.quality-0.55)*-0.004, 0.1, 0.95);
+    // 規模が大きくなるほど比例成長には収穫逓減が働く(日本株の仕組みと同一の考え方)
+    const scale = Math.abs(g.profit)/(Math.abs(g.baseProfit)||Math.abs(g.profit)||1);
+    const damping = clamp(1/Math.pow(1+Math.max(0,Math.log10(scale)),2.1), 0.02, 1);
+    g.profit *= (1 + (g.growth/100/365)*damping);
+    g.revenue *= (1 + (g.growth/100/365*0.7)*damping);
+    g.profit = clamp(g.profit, -Math.abs(g.baseProfit)*3000, Math.abs(g.baseProfit)*3000);
+
+    // 実際の時価総額は理論企業価値へ緩やかに収束しつつ、短期的な市場心理のノイズを伴う
+    const fv = globalCompanyFairValue(g);
+    const gapPct = (fv - g.capCurrent)/g.capCurrent;
+    const reversion = gapPct<0 ? clamp(gapPct*0.02, -0.05, 0) : clamp(gapPct*0.01, 0, 0.03);
+    g.capCurrent = Math.max(1e8, g.capCurrent*(1+reversion+rand(-0.006,0.006)));
+
+    updateGlobalCompanyLifecycle(g);
+  });
+}
+// 企業のライフサイクル(成長期→成熟期→衰退期→再建 or 消滅)。永遠に成長し続ける・上位に居座り続けることを防ぐ
+function updateGlobalCompanyLifecycle(g){
+  // 経営危機ショック(低確率): 競争激化・技術革新への対応遅れなどを想定し、業績が急激に悪化するきっかけを作る
+  if((g.stage==="growth"||g.stage==="mature") && Math.random()<0.00008){
+    g.growth = clamp(g.growth - rand(8,20), -15, g.growth);
+    g.quality = clamp(g.quality - rand(0.1,0.25), 0.05, g.quality);
+  }
+  if(g.stage==="growth" && g.growth<3 && Math.random()<0.001) g.stage="mature";
+  if(g.stage==="mature" && (g.growth<0 || g.quality<0.4) && Math.random()<0.0015) g.stage="decline";
+  if(g.stage==="decline"){
+    if(Math.random()<0.002){
+      if(Math.random()<0.35){ g.stage="mature"; g.growth=clamp(g.growth+rand(4,10),1,15); g.quality=clamp(g.quality+rand(0.05,0.15),0,1); }
+      else { g.stage="dead"; g.deathDay=state.day; }
+    }
+  }
+}
+// 新興企業の継続的な誕生(100年プレイしても最初の顔ぶれだけでランキングが固定化しないようにする)
+function checkNewGlobalCompanyBirth(){
+  const aliveCount = state.globalCompanies.filter(g=>g.stage!=="dead").length;
+  if(aliveCount>=13) return;
+  if(Math.random()>=0.0012) return;
+  const name = `${pick(GLOBAL_COMPANY_NAME_PARTS.base)} ${pick(GLOBAL_COMPANY_NAME_PARTS.suffix)}`;
+  const def = {
+    id:"gc_new"+Date.now()+randInt(0,999), name, region:pick(["アメリカ","ヨーロッパ","中国","インド","東南アジア"]),
+    sector:pick(GLOBAL_COMPANY_SECTORS), baseRevenue:rand(0.3,3)*1e9, baseProfit:rand(0.05,0.6)*1e9,
+    growth:rand(15,45), quality:rand(0.3,0.6),
+  };
+  state.globalCompanies.push(initGlobalCompanyRuntime(def, state.day));
+  // 消滅済み企業を間引く(記録として一定期間は残す)
+  state.globalCompanies = state.globalCompanies.filter(g=>g.stage!=="dead" || (state.day-(g.deathDay||0))<1825);
 }
 function computeWorldRanking(){
   const entries = [];
-  state.globalCompanies.forEach(g=> entries.push({name:g.name, region:g.region, cap:g.capCurrent, isPlayer:false}));
+  state.globalCompanies.filter(g=>g.stage!=="dead").forEach(g=> entries.push({name:g.name, region:g.region, cap:g.capCurrent, isPlayer:false}));
   state.stocks.forEach(st=>{
     const v = state.ventures.find(x=>x.listedStockId===st.id && x.stage==="listed");
     entries.push({name:st.name, region:"日本", cap:st.price*st.shares, isPlayer: !!v});
@@ -3059,6 +3513,26 @@ function computeVentureKPIs(v){
     brand: clamp(v.brand||0, 0, 100),
   };
 }
+// 会社の評価(成長性・収益性・財務健全性・技術力・ブランド力・人材力・経営力を100点満点で算出する)
+function computeVentureEvaluation(v){
+  const t = ventureTarget(v);
+  const growth = clamp((t.growth+15)/60*100, 0, 100);
+  const margin = t.revenue>0 ? t.profit/t.revenue : 0;
+  const profitability = clamp(50+margin*250, 0, 100);
+  const financial = clamp(((v.cashBalance||0)/Math.max(1,t.revenue*0.3))*50, 0, 100);
+  const tech = clamp((v.techScore||3)*18 + (v.patents||0)*4, 0, 100);
+  const brand = clamp(v.brand||30, 0, 100);
+  const execCount = Object.values(v.executives||{}).filter(Boolean).length;
+  const talent = clamp((v.management||3)*16 + execCount*8, 0, 100);
+  const management = clamp((v.competitiveness||3)*14 + t.quality*45, 0, 100);
+  const overall = Math.round((growth+profitability+financial+tech+brand+talent+management)/7);
+  const toGrade = (score)=> score>=85?"S":score>=70?"A":score>=50?"B":score>=30?"C":"D";
+  return {
+    growth:Math.round(growth), profitability:Math.round(profitability), financial:Math.round(financial),
+    tech:Math.round(tech), brand:Math.round(brand), talent:Math.round(talent), management:Math.round(management),
+    overall, grade: toGrade(overall),
+  };
+}
 
 // 役員(CEO/CFO/CTO/COO)。タイプによって強化される領域が異なる
 const EXEC_TYPES = {
@@ -3303,13 +3777,34 @@ function ventureIssueNewShares(ventureId, amount){
 
 // 低確率の特別イベント(上場後も継続して発生する)
 const VENTURE_SPECIAL_EVENTS = [
-  {text:(n)=>`${n}が大型受注を獲得した`, effect:(v)=>{ ventureTarget(v).revenue*=rand(1.1,1.25); }},
-  {text:(n)=>`${n}が新技術の開発に成功した`, effect:(v)=>{ const t=ventureTarget(v); t.quality=clamp(t.quality+0.05,0,0.97); }},
-  {text:(n)=>`${n}が特許を取得した`, effect:(v)=>{ v.patents=(v.patents||0)+1; }},
-  {text:(n)=>`${n}の新製品が大ヒットした`, effect:(v)=>{ ventureTarget(v).revenue*=rand(1.15,1.35); v.brand=clamp((v.brand||30)+8,0,100); }},
-  {text:(n)=>`${n}の競合企業が倒産し、シェア拡大の好機を迎えた`, effect:(v)=>{ v.marketShare=clamp((v.marketShare||5)+rand(2,6),0,100); ventureTarget(v).revenue*=1.08; }},
-  {text:(n)=>`${n}が政府との大型契約を締結した`, effect:(v)=>{ ventureTarget(v).revenue*=rand(1.12,1.3); }},
-  {text:(n)=>`${n}にとって業界再編の動きが追い風となっている`, effect:(v)=>{ v.marketShare=clamp((v.marketShare||5)+rand(1,4),0,100); }},
+  // 好材料
+  {type:"good", text:(n)=>`${n}が大型受注を獲得した`, effect:(v)=>{ ventureTarget(v).revenue*=rand(1.1,1.25); }},
+  {type:"good", text:(n)=>`${n}が新技術の開発に成功した`, effect:(v)=>{ const t=ventureTarget(v); t.quality=clamp(t.quality+0.05,0,0.97); }},
+  {type:"good", text:(n)=>`${n}が特許を取得した`, effect:(v)=>{ v.patents=(v.patents||0)+1; v.brand=clamp((v.brand||30)+3,0,100); }},
+  {type:"good", text:(n)=>`${n}の新製品が大ヒットした`, effect:(v)=>{ ventureTarget(v).revenue*=rand(1.15,1.35); v.brand=clamp((v.brand||30)+8,0,100); }},
+  {type:"good", text:(n)=>`${n}の競合企業が倒産し、シェア拡大の好機を迎えた`, effect:(v)=>{ v.marketShare=clamp((v.marketShare||5)+rand(2,6),0,100); ventureTarget(v).revenue*=1.08; }},
+  {type:"good", text:(n)=>`${n}が政府との大型契約を締結した`, effect:(v)=>{ ventureTarget(v).revenue*=rand(1.12,1.3); }},
+  {type:"good", text:(n)=>`${n}にとって業界再編の動きが追い風となっている`, effect:(v)=>{ v.marketShare=clamp((v.marketShare||5)+rand(1,4),0,100); }},
+  {type:"good", text:(n)=>`${n}に優秀な人材が入社し、組織力が強化された`, effect:(v)=>{ v.management=Math.min(5,(v.management||3)+1); }},
+  {type:"good", text:(n)=>`${n}が新市場を開拓した`, effect:(v)=>{ const t=ventureTarget(v); t.growth=clamp(t.growth+rand(2,6),-15,45); }},
+  {type:"good", text:(n)=>`${n}が政府補助金の交付を受けた`, effect:(v)=>{ v.cashBalance=(v.cashBalance||0)+rand(5_000_000,30_000_000); }},
+  {type:"good", text:(n)=>`${n}の事業分野で規制緩和が実施された`, effect:(v)=>{ const t=ventureTarget(v); t.growth=clamp(t.growth+rand(1,4),-15,45); }},
+  {type:"good", text:(n)=>`市場金利の低下により、${n}の資金調達環境が改善した`, effect:(v)=>{ v.cashBalance=(v.cashBalance||0)+Math.round((v.cashBalance||0)*0.03); }},
+  {type:"good", text:(n)=>`${n}の海外進出が軌道に乗り始めた`, effect:(v)=>{ ventureTarget(v).revenue*=rand(1.05,1.15); }},
+  // 悪材料
+  {type:"event", text:(n)=>`${n}が大型契約を競合に奪われた`, effect:(v)=>{ ventureTarget(v).revenue*=rand(0.85,0.95); }},
+  {type:"event", text:(n)=>`${n}が特許訴訟を起こされた`, effect:(v)=>{ v.cashBalance=Math.max(0,(v.cashBalance||0)-rand(5_000_000,20_000_000)); v.brand=clamp((v.brand||30)-5,0,100); }},
+  {type:"event", text:(n)=>`${n}の幹部が退職した`, effect:(v)=>{ v.management=Math.max(1,(v.management||3)-1); }},
+  {type:"event", text:(n)=>`${n}で不祥事が発覚した`, effect:(v)=>{ v.brand=clamp((v.brand||30)-rand(10,20),0,100); ventureTarget(v).revenue*=rand(0.88,0.96); }},
+  {type:"event", text:(n)=>`${n}の製品にリコールが発生した`, effect:(v)=>{ v.cashBalance=Math.max(0,(v.cashBalance||0)-rand(8_000_000,25_000_000)); v.brand=clamp((v.brand||30)-8,0,100); }},
+  {type:"event", text:(n)=>`${n}がサイバー攻撃を受けた`, effect:(v)=>{ v.cashBalance=Math.max(0,(v.cashBalance||0)-rand(5_000_000,18_000_000)); v.brand=clamp((v.brand||30)-6,0,100); }},
+  {type:"event", text:(n)=>`原材料価格の高騰が${n}の収益を圧迫している`, effect:(v)=>{ const t=ventureTarget(v); t.profit*=rand(0.85,0.95); }},
+  {type:"event", text:(n)=>`${n}の事業領域に有力なライバル企業が登場した`, effect:(v)=>{ v.competitiveness=Math.max(1,(v.competitiveness||3)-1); v.marketShare=clamp((v.marketShare||5)-rand(1,3),0,100); }},
+  {type:"event", text:(n)=>`${n}の海外進出が想定通りに進んでいない`, effect:(v)=>{ ventureTarget(v).revenue*=rand(0.9,0.97); }},
+  {type:"event", text:(n)=>`${n}の事業分野で規制が強化された`, effect:(v)=>{ const t=ventureTarget(v); t.growth=clamp(t.growth-rand(1,4),-15,45); }},
+  {type:"event", text:(n)=>`災害の影響で${n}の生産活動の一部が停止した`, effect:(v)=>{ v.cashBalance=Math.max(0,(v.cashBalance||0)-rand(10_000_000,40_000_000)); ventureTarget(v).revenue*=rand(0.85,0.95); }},
+  {type:"event", text:(n)=>`市場金利の上昇により、${n}の資金調達コストが増加している`, effect:(v)=>{ v.cashBalance=Math.max(0,(v.cashBalance||0)-Math.round((v.cashBalance||0)*0.02)); }},
+  {type:"event", text:(n)=>`景気後退の影響で${n}の受注環境が悪化している`, effect:(v)=>{ const t=ventureTarget(v); t.growth=clamp(t.growth-rand(1,5),-15,45); }},
 ];
 // 独占技術の発見(超低確率・企業価値を大幅に押し上げる)
 const EXCLUSIVE_TECHS = ["次世代半導体","量子コンピューター","革新的なAI","新エネルギー技術"];
@@ -3526,7 +4021,7 @@ function updateVentures(){
     if(roll<0.03){
       const ev = pick(VENTURE_SPECIAL_EVENTS);
       ev.effect(v);
-      pushNews(ev.text(v.name), {stars:4, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+      pushNews(ev.text(v.name), {stars: ev.type==="good"?4:3, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:ev.type});
     } else if(roll<0.18){
       if(Math.random()<0.5){
         t.revenue *= 1.10;
@@ -3920,8 +4415,14 @@ function advanceDay(){
       const expectationStrength = clamp(controlPct*1.5, 0, 0.8); // 成立期待が高いほどTOB価格へ引き寄せられる
       changePct += gapToTob*expectationStrength*0.15;
     }
-    if(instEvent && instEvent.stockId===st.id) changePct += instEvent.impactPct;
-    if(materialEvent && materialEvent.stockId===st.id) changePct += materialEvent.impactPct;
+    if(instEvent && instEvent.stockId===st.id){
+      changePct += instEvent.impactPct;
+      if(instEvent.impactPct>0.02) changePct += shortSqueezeBoost(st); // 好材料×空売り比率の高さで踏み上げが発生する
+    }
+    if(materialEvent && materialEvent.stockId===st.id){
+      changePct += materialEvent.impactPct;
+      if(materialEvent.impactPct>0.02) changePct += shortSqueezeBoost(st);
+    }
 
     // 決算
     st.daysUntilEarnings -= 1;
@@ -3934,6 +4435,7 @@ function advanceDay(){
     if(st.daysUntilEarnings<=0){
       earningsFired = resolveEarnings(st);
       changePct += earningsFired.pct;
+      if(earningsFired.pct>0.03) changePct += shortSqueezeBoost(st); // 好決算×空売り比率の高さで踏み上げが発生する
       st.earningsCycle = randInt(st.ecMin, st.ecMax);
       st.daysUntilEarnings = st.earningsCycle;
     }
@@ -4070,6 +4572,7 @@ function advanceDay(){
   checkVentureListings();
   updateRivals();
   updateActiveTob();
+  updateMarginPositions();
   updateMarketSentiment();
   updateGlobalCompanies();
   checkLegendaryFeats();
@@ -4695,7 +5198,7 @@ function renderPortfolio(){
 
   wrap.appendChild(el(`
     <div class="sec">
-      <div class="sec-head"><h2>保有株サマリー</h2><span class="sub">${holdingIds.length}銘柄</span></div>
+      <div class="sec-head"><h2>保有株サマリー(現物)</h2><span class="sub">${holdingIds.length}銘柄</span></div>
       <div class="grid-2">
         <div class="stat-box"><div class="l">評価額合計</div><div class="v">${fmtYen(totalVal)}</div></div>
         <div class="stat-box"><div class="l">取得コスト合計</div><div class="v">${fmtYen(totalCost)}</div></div>
@@ -4704,6 +5207,44 @@ function renderPortfolio(){
       </div>
     </div>
   `));
+
+  if(state.marginAccount && state.marginAccount.opened){
+    const marginRatio = computeMaintenanceRatio();
+    const marginSec = document.createElement('div');
+    marginSec.className='sec';
+    if(state.marginPositions.length){
+      marginSec.innerHTML = `
+        <div class="sec-head"><h2>信用取引サマリー</h2><span class="sub">${state.marginPositions.length}建玉</span></div>
+        <div class="grid-2">
+          <div class="stat-box"><div class="l">保証金維持率</div><div class="v" style="color:${marginRatio.ratio>=MARGIN_SAFE_THRESHOLD?'var(--green)':(marginRatio.ratio>=MARGIN_WARN_THRESHOLD?'var(--amber)':'var(--red)')};">${marginRatio.ratio.toFixed(1)}%</div></div>
+          <div class="stat-box"><div class="l">状態</div><div class="v">${marginRatioStatusLabel(marginRatio.ratio)}</div></div>
+          <div class="stat-box"><div class="l">委託保証金合計</div><div class="v">${fmtYen(marginRatio.totalMargin)}</div></div>
+          <div class="stat-box"><div class="l">評価損益</div><div class="v ${marginRatio.totalUnrealizedPL>=0?'gain':'loss'}">${marginRatio.totalUnrealizedPL>=0?'+':''}${fmtYen(marginRatio.totalUnrealizedPL)}</div></div>
+        </div>
+        <div class="sec-body" style="padding:8px 0 0;" id="margin-pf-body"></div>
+      `;
+    } else {
+      marginSec.innerHTML = `<div class="sec-head"><h2>信用取引サマリー</h2></div><div class="empty-state">現在、信用建玉はありません。</div>`;
+    }
+    wrap.appendChild(marginSec);
+    const marginBody = marginSec.querySelector('#margin-pf-body');
+    if(marginBody){
+      state.marginPositions.forEach(p=>{
+        const st = state.stocks.find(s=>s.id===p.stockId);
+        if(!st) return;
+        const pl = p.side==="long" ? (st.price-p.entryPrice)*p.qty : (p.entryPrice-st.price)*p.qty;
+        const row = el(`
+          <div class="row">
+            <div class="row-left"><div class="nm">${st.name} ${p.side==='long'?'信用買い':'空売り'}</div><div class="sub">${fmtNum(p.qty)}株・建値¥${fmtNum(p.entryPrice)}</div></div>
+            <div class="row-right"><div class="px ${pl>=0?'gain':'loss'}">${pl>=0?'+':''}${fmtYen(pl)}</div></div>
+          </div>
+        `);
+        row.style.cursor='pointer';
+        row.onclick = ()=>{ openStockModal(st.id); modalSubtab='margin'; renderStockModal(); };
+        marginBody.appendChild(row);
+      });
+    }
+  }
 
   if(!holdingIds.length){
     wrap.appendChild(el(`<div class="sec"><div class="empty-state">まだ株を保有していません。<br>「銘柄」タブから購入しましょう。</div></div>`));
@@ -4846,7 +5387,7 @@ function renderCompany(){
      ① 会社(MY INVESTMENT・実績・投資スタイル)
      ============================================================ */
   const totalRealized = (state.stats.realizedProfit||0) - (state.stats.realizedLoss||0);
-  const totalReturn = ((nw-1_000_000)/1_000_000*100);
+  const totalReturn = ((nw-10_000_000)/10_000_000*100); // 初期資金1,000万円を基準に算出
   const prog = xpProgress();
   const winRate = state.stats.totalTrades>0 ? (state.stats.winTrades/state.stats.totalTrades*100) : 0;
   wrap.appendChild(el(`
@@ -5249,6 +5790,7 @@ function renderStockModal(){
       <span id="stock-modal-pct" class="pill ${pct>=0?'gain':'loss'}" style="font-size:12px;">${fmtPct(pct)}</span>
     </div>
     <div id="stock-modal-badges" style="margin-bottom:4px; display:flex; gap:5px; flex-wrap:wrap;">${themeBadge}${rumorBadge}${stopBadge}${ventureBadge}</div>
+    <button class="btn btn-cyan btn-block" id="btn-open-order-menu" style="margin-bottom:8px; font-weight:800;">注文</button>
     ${linkedVenture ? `<button class="btn btn-ghost btn-block btn-sm" id="btn-manage-venture" style="margin-bottom:8px;">この企業を経営する →</button>` : ''}
     ${showTakeoverEntry ? `<button class="btn btn-red btn-block btn-sm" id="btn-open-takeover" style="margin-bottom:8px;">M&A:敵対的買収を検討する(保有${playerVotingPct.toFixed(1)}%)</button>` : ''}
 
@@ -5260,21 +5802,18 @@ function renderStockModal(){
       <button class="subtab-btn ${modalSubtab==='board'?'active':''}" data-sub="board">掲示板</button>
     </div>
     <div id="modal-subbody"></div>
-
-    <div style="height:14px;"></div>
-    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>注文</h2><span class="sub">保有${fmtNum(owned)}株(注文可能${fmtNum(availShares)}株)</span></div>
-    <div style="padding:10px 0 0;" id="order-form"></div>
   `;
 
   modal.querySelector('#modal-close').onclick = closeModal;
   modal.querySelectorAll('[data-sub]').forEach(b=>{ b.onclick = ()=>{ switchModalSubtab(b.dataset.sub); }; });
+  const orderMenuBtn = modal.querySelector('#btn-open-order-menu');
+  if(orderMenuBtn) orderMenuBtn.onclick = ()=>{ openOrderMenuModal(st.id); };
   const manageBtn = modal.querySelector('#btn-manage-venture');
   if(manageBtn) manageBtn.onclick = ()=>{ openVentureModal(linkedVenture.id); };
   const takeoverBtn = modal.querySelector('#btn-open-takeover');
   if(takeoverBtn) takeoverBtn.onclick = ()=>{ openTakeoverModal(st.id); };
 
   renderModalSubbody(st);
-  renderOrderForm(st, owned, availShares);
 }
 
 // サブタブ切替: #modal-subbody だけを差し替える。ヘッダーや注文フォーム(入力中の値)には一切触れない
@@ -5344,7 +5883,6 @@ function refreshStockModalLive(){
   if(modalSubtab==="chart"){
     drawStockDetailChart(st);
   }
-  refreshOrderFormPreview(st);
 }
 
 function renderModalChartTab(st){
@@ -6182,6 +6720,7 @@ function renderVentureModal(ventureId){
   } else if(v.stage==="private" || v.stage==="listed"){
     const readiness = v.stage==="private" ? ventureIpoReadiness(v) : null;
     const kpis = computeVentureKPIs(v);
+    const evaluation = computeVentureEvaluation(v);
     const stage = ventureGrowthStage(v);
     const pendingHere = state.pendingBoardDecisions.filter(d=>d.ventureId===v.id);
     const rdOptions = rdThemeOptions(v.sector);
@@ -6235,6 +6774,18 @@ function renderVentureModal(ventureId){
         <div class="stat-box"><div class="l">IPO達成率</div><div class="v">${kpis.ipoAchievement}%</div></div>
         <div class="stat-box"><div class="l">企業ブランド</div><div class="v">${kpis.brand.toFixed(0)}/100</div></div>
       </div>
+
+      <div style="height:14px;"></div>
+      <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>会社の評価</h2><span class="sub">総合${evaluation.overall}点(${evaluation.grade})</span></div>
+      <table class="dtable">
+        <tr><td>成長性</td><td>${evaluation.growth}/100</td></tr>
+        <tr><td>収益性</td><td>${evaluation.profitability}/100</td></tr>
+        <tr><td>財務健全性</td><td>${evaluation.financial}/100</td></tr>
+        <tr><td>技術力</td><td>${evaluation.tech}/100</td></tr>
+        <tr><td>ブランド力</td><td>${evaluation.brand}/100</td></tr>
+        <tr><td>人材力</td><td>${evaluation.talent}/100</td></tr>
+        <tr><td>経営力</td><td>${evaluation.management}/100</td></tr>
+      </table>
 
       <div style="height:14px;"></div>
       <table class="dtable">
@@ -6389,6 +6940,407 @@ function renderVentureModal(ventureId){
 }
 
 // 投資家掲示板タブ: 市場参加者の意見と市場センチメントを表示する
+// 信用取引タブ: 口座開設・信用買い/空売り注文・この銘柄の建玉一覧・保証金維持率を表示する
+/* ==========================================================================
+   注文メニュー・注文画面(独立タブ)・注文管理(証券アプリ型の注文フロー)
+   ========================================================================== */
+let orderEntryDraft = {}; // stockId+mode ごとの下書き(数量・価格・注文方法を維持する)
+const ORDER_MODE_LABELS = {spot_buy:"現物買", spot_sell:"現物売", margin_buy:"信用新規買", margin_sell:"信用新規売(空売り)", margin_close_sell:"信用返済売", margin_close_buy:"信用返済買"};
+
+// 注文メニュー(銘柄詳細から開く。現物/信用/返済のどれを行うかを選ぶ入口)
+function openOrderMenuModal(stockId){ showModal(); renderOrderMenuModal(stockId); }
+function renderOrderMenuModal(stockId){
+  const st = state.stocks.find(s=>s.id===stockId);
+  const modal = document.getElementById('modal');
+  if(!st){ modal.innerHTML = `<div class="modal-handle"></div><div class="empty-state">銘柄が見つかりません</div>`; return; }
+  const pos = state.portfolio[stockId];
+  const longPos = state.marginPositions.find(p=>p.stockId===stockId && p.side==='long');
+  const shortPos = state.marginPositions.find(p=>p.stockId===stockId && p.side==='short');
+  const marginOpen = state.marginAccount && state.marginAccount.opened;
+  const pct = (st.price/st.prevPrice-1)*100;
+  modal.innerHTML = `
+    <div class="modal-handle"></div>
+    <div style="text-align:center; padding:10px 0 14px;">
+      <div style="font-size:11px; color:var(--muted); font-family:var(--font-wide);">(${st.id}) ${st.name}</div>
+      <div style="display:flex; justify-content:center; align-items:baseline; gap:8px; margin-top:4px;">
+        <div style="font-size:24px; font-weight:800;">¥${fmtNum(st.price)}</div>
+        <span class="pill ${pct>=0?'gain':'loss'}">${fmtPct(pct)}</span>
+      </div>
+    </div>
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>現物取引</h2></div>
+    <div class="buy-sell-row">
+      <button class="btn btn-cyan btn-block" data-order-menu="spot_buy">現物買</button>
+      <button class="btn btn-ghost btn-block" data-order-menu="spot_sell" ${pos?'':'disabled'}>現物売</button>
+    </div>
+    <div style="height:12px;"></div>
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>信用取引</h2><span class="sub">${marginOpen?'':'口座未開設'}</span></div>
+    ${marginOpen ? `
+    <div class="buy-sell-row">
+      <button class="btn btn-cyan btn-block" data-order-menu="margin_buy" ${isMarginEligible(st)?'':'disabled'}>信用新規買</button>
+      <button class="btn btn-ghost btn-block" data-order-menu="margin_sell" ${isShortSellEligible(st)?'':'disabled'}>信用新規売</button>
+    </div>
+    <div class="buy-sell-row" style="margin-top:8px;">
+      <button class="btn btn-ghost btn-block" data-order-menu="margin_close_sell" ${longPos?'':'disabled'}>信用返済売</button>
+      <button class="btn btn-ghost btn-block" data-order-menu="margin_close_buy" ${shortPos?'':'disabled'}>信用返済買</button>
+    </div>
+    ` : `
+    <div class="sec-body" style="padding:8px 0;">
+      <div style="font-size:10.5px; color:var(--muted); line-height:1.7; margin-bottom:8px; font-family:var(--font-wide);">信用取引口座を開設すると、信用買い・空売りが利用できるようになります。</div>
+      ${(()=>{ const chk=canOpenMarginAccount(); return chk.ok ? `<button class="btn btn-red btn-block btn-sm" id="btn-open-margin-account-from-menu">信用取引口座を開設する</button>` : `<div style="font-size:10.5px; color:var(--red); line-height:1.8; font-family:var(--font-wide);">開設条件を満たしていません:<br>${chk.reasons.map(r=>`・${r}`).join("<br>")}</div>`; })()}
+    </div>
+    `}
+    <div style="height:14px;"></div>
+    <button class="btn btn-ghost btn-block" id="btn-order-manage">注文管理を開く</button>
+  `;
+  modal.querySelector('#btn-order-manage').onclick = openOrderManagementModal;
+  modal.querySelectorAll('[data-order-menu]').forEach(b=>{
+    if(b.disabled) return;
+    b.onclick = ()=>{ openOrderEntryModal(stockId, b.dataset.orderMenu); };
+  });
+  const openMarginBtn = modal.querySelector('#btn-open-margin-account-from-menu');
+  if(openMarginBtn) openMarginBtn.onclick = ()=>{
+    const r = openMarginAccount();
+    toast(r.msg);
+    renderOrderMenuModal(stockId);
+    render();
+  };
+}
+
+// 注文画面(独立タブ)。参考画像の構成(現在値・注文種別・株数・価格・執行条件・発注)を、既存UIに合わせて実装する
+function openOrderEntryModal(stockId, mode){ showModal(); renderOrderEntryModal(stockId, mode); }
+function renderOrderEntryModal(stockId, mode){
+  const st = state.stocks.find(s=>s.id===stockId);
+  const modal = document.getElementById('modal');
+  if(!st) return;
+  const isBuy = mode==="spot_buy" || mode==="margin_buy" || mode==="margin_close_buy";
+  const isMargin = mode.startsWith("margin");
+  const isClose = mode.includes("close");
+  const isSpotSell = mode==="spot_sell";
+  const pct = (st.price/st.prevPrice-1)*100;
+  const band = getPriceLimitBand(st.price);
+
+  let targetPositions = [];
+  if(isClose){
+    const side = mode==="margin_close_sell" ? "long" : "short";
+    targetPositions = state.marginPositions.filter(p=>p.stockId===stockId && p.side===side);
+  }
+
+  const draftKey = stockId+"_"+mode;
+  if(!orderEntryDraft[draftKey]) orderEntryDraft[draftKey] = {orderType:"market", qty:"100", limitPrice:String(Math.round(st.price)), stopPrice:String(Math.round(st.price)), ocoLimitPrice:String(Math.round(st.price*1.1)), ocoStopPrice:String(Math.round(st.price*0.9)), positionId: targetPositions[0]?targetPositions[0].id:null, skipConfirm:false};
+  const draft = orderEntryDraft[draftKey];
+
+  const availableTypes = ["market"];
+  if(canUseLimitOrders()) availableTypes.push("limit");
+  if(canUseStopOrders()) availableTypes.push("stop");
+  if(canUseOCOOrders() && isSpotSell) availableTypes.push("oco");
+  if(!availableTypes.includes(draft.orderType)) draft.orderType="market";
+
+  let infoRows = "";
+  if(mode==="spot_buy"){
+    infoRows = `<tr><td>買付可能額</td><td>${fmtYen(availableCash())}</td></tr>`;
+  } else if(mode==="spot_sell"){
+    const pos = state.portfolio[stockId];
+    infoRows = `<tr><td>保有株数</td><td>${fmtNum(pos?pos.shares:0)}株</td></tr><tr><td>売却可能株数</td><td>${fmtNum(availableShares(stockId))}株</td></tr>`;
+  } else if(mode==="margin_buy"){
+    infoRows = `<tr><td>信用余力</td><td>${fmtYen(availableCash())}</td></tr>`;
+  } else if(mode==="margin_sell"){
+    infoRows = `<tr><td>空売り可能株数(目安)</td><td>${fmtNum(floatShares(st))}株</td></tr><tr><td>信用余力</td><td>${fmtYen(availableCash())}</td></tr>`;
+  } else if(isClose){
+    const p = targetPositions.find(x=>x.id===draft.positionId) || targetPositions[0];
+    if(p){
+      const pl = p.side==="long" ? (st.price-p.entryPrice)*p.qty : (p.entryPrice-st.price)*p.qty;
+      infoRows = `
+        <tr><td>建玉数量</td><td>${fmtNum(p.qty)}株</td></tr>
+        <tr><td>平均取得価格</td><td>¥${fmtNum(p.entryPrice)}</td></tr>
+        <tr><td>保有日数</td><td>${state.day-p.entryDay}日</td></tr>
+        <tr><td>評価損益</td><td style="color:${pl>=0?'var(--green)':'var(--red)'};">${pl>=0?'+':''}${fmtYen(pl)}</td></tr>
+        <tr><td>${p.side==='long'?'金利':'貸株料'}</td><td>${fmtYen(p.side==='long'?p.accruedInterest:p.accruedBorrowFee)}</td></tr>
+      `;
+    } else {
+      infoRows = `<tr><td colspan="2">対象の建玉がありません</td></tr>`;
+    }
+  }
+
+  modal.innerHTML = `
+    <div class="modal-handle"></div>
+    <div class="modal-header"><div class="modal-title">(${st.id}) ${st.name}</div><button class="modal-close" id="modal-close">✕</button></div>
+    <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;">
+      <div style="font-size:10px; color:var(--muted); font-family:var(--font-wide);">現在値</div>
+      <div style="display:flex; align-items:baseline; gap:8px;">
+        <div id="order-entry-price" style="font-size:24px; font-weight:800;">¥${fmtNum(st.price)}</div>
+        <span id="order-entry-pct" class="pill ${pct>=0?'gain':'loss'}">${fmtPct(pct)}</span>
+      </div>
+    </div>
+    <div class="${isBuy?'btn-cyan':'btn-red'}" style="text-align:center; padding:10px; font-weight:800; font-size:13px; color:#fff; background:${isBuy?'var(--cyan)':'var(--red)'};">${ORDER_MODE_LABELS[mode]}(注文入力)</div>
+
+    ${isClose && targetPositions.length>1 ? `
+      <div class="price-input-row" style="margin-top:10px;"><label>対象建玉</label>
+        <select id="order-position-select" style="flex:1; background:var(--panel-alt); border:1px solid var(--line); color:var(--text); padding:8px; font-family:var(--font);">
+          ${targetPositions.map(p=>`<option value="${p.id}" ${p.id===draft.positionId?'selected':''}>${fmtNum(p.qty)}株 @¥${fmtNum(p.entryPrice)}</option>`).join("")}
+        </select>
+      </div>
+    ` : ''}
+
+    <table class="dtable" style="margin-top:10px;">${infoRows}</table>
+
+    <div style="height:12px;"></div>
+    <div style="font-size:9.5px; color:var(--muted-2); margin-bottom:4px; font-family:var(--font-wide);">注文方法</div>
+    <div class="toggle-row">
+      ${availableTypes.map(t=>`<button class="btn-toggle ${draft.orderType===t?'active':''}" data-otype="${t}">${ORDER_TYPE_LABELS[t]}</button>`).join("")}
+    </div>
+
+    <div class="price-input-row" style="margin-top:10px;">
+      <label>株数</label>
+      <div class="qty-stepper">
+        <button class="qty-btn" id="oe-qty-minus">−</button>
+        <input type="number" id="oe-qty-input" value="${draft.qty}" min="100" step="100">
+        <button class="qty-btn" id="oe-qty-plus">+</button>
+      </div>
+    </div>
+
+    ${draft.orderType==="market" ? `
+      <div class="price-input-row"><label>価格</label><div style="flex:1; padding:7px 8px; color:var(--muted); font-family:var(--font);">成行(現在値 ¥${fmtNum(st.price)})</div></div>
+    ` : draft.orderType==="limit" ? `
+      <div class="price-input-row"><label>指値価格</label><input type="number" id="oe-limit-price" value="${draft.limitPrice}"></div>
+      <div style="font-size:9.5px; color:var(--muted-2); margin:-2px 0 6px; font-family:var(--font-wide);">制限値幅目安: ¥${fmtNum(st.price-band)}〜¥${fmtNum(st.price+band)}</div>
+    ` : draft.orderType==="stop" ? `
+      <div class="price-input-row"><label>逆指値トリガー</label><input type="number" id="oe-stop-price" value="${draft.stopPrice}"></div>
+      <div style="font-size:9.5px; color:var(--muted-2); margin:-2px 0 6px; font-family:var(--font-wide);">トリガー到達後、成行で発注されます</div>
+    ` : draft.orderType==="oco" ? `
+      <div class="price-input-row"><label>利確価格</label><input type="number" id="oe-oco-limit" value="${draft.ocoLimitPrice}"></div>
+      <div class="price-input-row"><label>損切価格</label><input type="number" id="oe-oco-stop" value="${draft.ocoStopPrice}"></div>
+    ` : ''}
+
+    ${!isBuy && isMargin && !isClose ? `<div style="font-size:9.5px; color:var(--amber); margin:6px 0; font-family:var(--font-wide);">※空売りは株価が上昇すると損失、下落すると利益になります。理論上、損失は無限大になり得ます。</div>` : ''}
+
+    <table class="dtable" style="margin-top:10px;">
+      <tr><td>注文金額(目安)</td><td id="oe-amount-preview">-</td></tr>
+      <tr><td>${isMargin && !isClose ? '必要保証金(目安)' : '必要資金(目安)'}</td><td id="oe-required-preview">-</td></tr>
+      ${isMargin && !isClose ? `<tr><td>発注後の想定維持率</td><td id="oe-ratio-preview">-</td></tr>` : ''}
+    </table>
+
+    <div style="display:flex; align-items:center; gap:6px; margin-top:10px;">
+      <input type="checkbox" id="oe-skip-confirm" ${draft.skipConfirm?'checked':''}>
+      <label for="oe-skip-confirm" style="font-size:10.5px; color:var(--muted); font-family:var(--font-wide);">確認画面を省略する</label>
+    </div>
+
+    <div class="buy-sell-row" style="margin-top:14px;">
+      <button class="btn btn-ghost btn-block" id="btn-order-back">戻る</button>
+      <button class="btn ${isBuy?'btn-cyan':'btn-red'} btn-block" id="btn-order-submit">発注</button>
+    </div>
+  `;
+  modal.querySelector('#modal-close').onclick = closeModal;
+  modal.querySelector('#btn-order-back').onclick = ()=>{ openOrderMenuModal(stockId); };
+
+  const typeButtons = modal.querySelectorAll('[data-otype]');
+  typeButtons.forEach(b=>{ b.onclick = ()=>{ draft.orderType=b.dataset.otype; renderOrderEntryModal(stockId, mode); }; });
+
+  const posSelect = modal.querySelector('#order-position-select');
+  if(posSelect) posSelect.addEventListener('change', ()=>{ draft.positionId=posSelect.value; renderOrderEntryModal(stockId, mode); });
+
+  const qtyInput = modal.querySelector('#oe-qty-input');
+  const updatePreview = ()=>{
+    const qty = Math.max(TRADING_UNIT, parseInt(qtyInput.value)||TRADING_UNIT);
+    draft.qty = String(qty);
+    let refPrice = st.price;
+    if(draft.orderType==="limit"){ const el=modal.querySelector('#oe-limit-price'); if(el){ refPrice=parseFloat(el.value)||st.price; draft.limitPrice=el.value; } }
+    if(draft.orderType==="stop"){ const el=modal.querySelector('#oe-stop-price'); if(el){ refPrice=parseFloat(el.value)||st.price; draft.stopPrice=el.value; } }
+    if(draft.orderType==="oco"){
+      const el1=modal.querySelector('#oe-oco-limit'); if(el1) draft.ocoLimitPrice=el1.value;
+      const el2=modal.querySelector('#oe-oco-stop'); if(el2) draft.ocoStopPrice=el2.value;
+    }
+    const amount = refPrice*qty;
+    const requiredAmount = isMargin && !isClose ? amount*MARGIN_REQUIREMENT_RATE : (isBuy && !isClose ? amount*(1+feeRate()) : amount);
+    modal.querySelector('#oe-amount-preview').textContent = fmtYen(amount);
+    const reqEl = modal.querySelector('#oe-required-preview');
+    if(reqEl) reqEl.textContent = fmtYen(requiredAmount);
+    const ratioEl = modal.querySelector('#oe-ratio-preview');
+    if(ratioEl){
+      const existing = computeMaintenanceRatio();
+      const existingMargin = existing?existing.totalMargin:0;
+      const existingValue = existing?existing.totalPositionValue:0;
+      const newRatio = (existingMargin+requiredAmount)/(existingValue+amount)*100;
+      ratioEl.textContent = (existingValue+amount)>0 ? newRatio.toFixed(1)+"%" : "-";
+    }
+  };
+  qtyInput.addEventListener('input', updatePreview);
+  modal.querySelectorAll('#oe-limit-price,#oe-stop-price,#oe-oco-limit,#oe-oco-stop').forEach(inp=> inp && inp.addEventListener('input', updatePreview));
+  modal.querySelector('#oe-qty-minus').onclick = ()=>{ qtyInput.value=Math.max(TRADING_UNIT,(parseInt(qtyInput.value)||TRADING_UNIT)-TRADING_UNIT); updatePreview(); };
+  modal.querySelector('#oe-qty-plus').onclick = ()=>{ qtyInput.value=(parseInt(qtyInput.value)||0)+TRADING_UNIT; updatePreview(); };
+  updatePreview();
+
+  const skipConfirmBox = modal.querySelector('#oe-skip-confirm');
+  skipConfirmBox.addEventListener('change', ()=>{ draft.skipConfirm=skipConfirmBox.checked; });
+
+  modal.querySelector('#btn-order-submit').onclick = ()=>{
+    if(draft.skipConfirm) submitOrderEntry(stockId, mode, draft);
+    else openOrderConfirmModal(stockId, mode, draft);
+  };
+}
+function buildOrderParams(stockId, mode, draft){
+  const isBuy = mode==="spot_buy" || mode==="margin_buy" || mode==="margin_close_buy";
+  const isMargin = mode.startsWith("margin");
+  const isClose = mode.includes("close");
+  const qty = Math.max(TRADING_UNIT, parseInt(draft.qty)||TRADING_UNIT);
+  return {
+    stockId, side: isBuy?"buy":"sell", orderType: draft.orderType, qty,
+    limitPrice: parseFloat(draft.limitPrice)||undefined, stopPrice: parseFloat(draft.stopPrice)||undefined,
+    ocoLimitPrice: parseFloat(draft.ocoLimitPrice)||undefined, ocoStopPrice: parseFloat(draft.ocoStopPrice)||undefined,
+    validityDays: 30, tradeCategory: isMargin?"margin":"spot", marginAction: isMargin?(isClose?"close":"open"):null, positionId: isClose?draft.positionId:null,
+  };
+}
+function submitOrderEntry(stockId, mode, draft){
+  const params = buildOrderParams(stockId, mode, draft);
+  let r;
+  if(draft.orderType==="market"){
+    if(params.tradeCategory==="spot") r = params.side==="buy" ? buyStock(stockId, params.qty) : sellStock(stockId, params.qty);
+    else if(params.marginAction==="open") r = params.side==="buy" ? marginBuy(stockId, params.qty) : shortSell(stockId, params.qty);
+    else { const pos = state.marginPositions.find(p=>p.id===draft.positionId); r = pos ? closeMarginPosition(pos.id, Math.min(params.qty,pos.qty)) : {ok:false, msg:"対象の建玉が見つかりません"}; }
+  } else {
+    r = placeOrder(params);
+  }
+  toast(r.msg);
+  if(r.ok){ delete orderEntryDraft[stockId+"_"+mode]; closeModal(); render(); }
+}
+function openOrderConfirmModal(stockId, mode, draft){
+  const st = state.stocks.find(s=>s.id===stockId);
+  const modal = document.getElementById('modal');
+  const params = buildOrderParams(stockId, mode, draft);
+  const refPrice = draft.orderType==="market" ? st.price : (draft.orderType==="limit" ? params.limitPrice : (draft.orderType==="stop" ? params.stopPrice : params.ocoLimitPrice));
+  const isMargin = mode.startsWith("margin");
+  const isClose = mode.includes("close");
+  const amount = refPrice*params.qty;
+  modal.innerHTML = `
+    <div class="modal-handle"></div>
+    <div class="modal-header"><div class="modal-title">注文内容の確認</div><button class="modal-close" id="modal-close">✕</button></div>
+    <table class="dtable">
+      <tr><td>銘柄</td><td>(${st.id}) ${st.name}</td></tr>
+      <tr><td>取引区分</td><td>${ORDER_MODE_LABELS[mode]}</td></tr>
+      <tr><td>注文方法</td><td>${ORDER_TYPE_LABELS[draft.orderType]}</td></tr>
+      <tr><td>株数</td><td>${fmtNum(params.qty)}株</td></tr>
+      <tr><td>価格</td><td>${draft.orderType==="market"?"成行":`¥${fmtNum(refPrice)}`}</td></tr>
+      <tr><td>注文金額(目安)</td><td>${fmtYen(amount)}</td></tr>
+      ${isMargin && !isClose ? `<tr><td>必要保証金(目安)</td><td>${fmtYen(amount*MARGIN_REQUIREMENT_RATE)}</td></tr>` : ''}
+    </table>
+    <div class="buy-sell-row" style="margin-top:14px;">
+      <button class="btn btn-ghost btn-block" id="btn-confirm-back">修正する</button>
+      <button class="btn btn-cyan btn-block" id="btn-confirm-submit">注文を確定する</button>
+    </div>
+  `;
+  modal.querySelector('#modal-close').onclick = ()=>{ renderOrderEntryModal(stockId, mode); };
+  modal.querySelector('#btn-confirm-back').onclick = ()=>{ renderOrderEntryModal(stockId, mode); };
+  let submitted = false;
+  modal.querySelector('#btn-confirm-submit').onclick = ()=>{
+    if(submitted) return; // 二重発注防止
+    submitted = true;
+    submitOrderEntry(stockId, mode, draft);
+  };
+}
+
+// 注文管理画面: 未約定・一部約定・約定済み・取消済み・失効の注文を一覧表示し、指値変更・取消ができる
+function openOrderManagementModal(){ showModal(); renderOrderManagementModal(); }
+function renderOrderManagementModal(){
+  const modal = document.getElementById('modal');
+  const orders = [...state.pendingOrders].sort((a,b)=>b.createdDay-a.createdDay);
+  const statusLabel = (o)=>{
+    if(o.status==="cancelled") return "取消済み";
+    if(o.status==="expired") return "失効";
+    if(o.status==="filled") return "約定済み";
+    if((o.filledQty||0)>0) return "一部約定";
+    return "未約定";
+  };
+  modal.innerHTML = `
+    <div class="modal-handle"></div>
+    <div class="modal-header"><div class="modal-title">注文管理</div><button class="modal-close" id="modal-close">✕</button></div>
+    ${orders.length ? orders.map(o=>{
+      const st = state.stocks.find(s=>s.id===o.stockId);
+      const label = statusLabel(o);
+      const badgeCls = label==="約定済み" ? "gain" : (label==="取消済み"||label==="失効" ? "loss" : "info");
+      return `
+      <div class="row" style="cursor:default; align-items:flex-start; flex-direction:column; padding:10px 0; border-bottom:1px solid var(--line);">
+        <div style="display:flex; justify-content:space-between; width:100%;">
+          <div class="nm" style="font-size:12px;">${st?st.name:'(廃止銘柄)'} ・ ${o.tradeCategory==='margin'?(o.marginAction==='open'?(o.side==='buy'?'信用新規買':'信用新規売'):(o.side==='buy'?'信用返済買':'信用返済売')):(o.side==='buy'?'現物買':'現物売')}</div>
+          <span class="badge ${badgeCls}">${label}</span>
+        </div>
+        <div class="sub" style="margin-top:4px;">${ORDER_TYPE_LABELS[o.orderType]} ・ 注文${fmtNum(o.qty)}株 ・ 約定${fmtNum(o.filledQty||0)}株 ・ 未約定${fmtNum(o.qty-(o.filledQty||0))}株</div>
+        <div class="sub">${o.orderType==='limit'?`指値¥${fmtNum(o.limitPrice)}`:(o.orderType==='stop'?`逆指値¥${fmtNum(o.stopPrice)}`:(o.orderType==='oco'?`利確¥${fmtNum(o.limitPrice)}/損切¥${fmtNum(o.stopPrice)}`:'成行'))} ${st?`・ 現在値¥${fmtNum(st.price)}`:''}</div>
+        <div class="sub">発注日:${fmtDateShort(o.createdDay)} ・ 有効期限:${fmtDateShort(o.createdDay+o.validityDays)}</div>
+        ${o.status==='pending' ? `
+          <div class="buy-sell-row" style="margin-top:8px; width:100%;">
+            ${o.orderType!=='market' ? `<button class="btn btn-ghost btn-block btn-sm" data-modify-order="${o.id}">注文変更</button>` : ''}
+            <button class="btn btn-red btn-block btn-sm" data-cancel-order="${o.id}">取消</button>
+          </div>
+        ` : ''}
+      </div>
+    `;}).join("") : `<div class="empty-state">注文はまだありません</div>`}
+  `;
+  modal.querySelector('#modal-close').onclick = closeModal;
+  modal.querySelectorAll('[data-cancel-order]').forEach(b=>{
+    b.onclick = ()=>{
+      if(!confirm('この注文を取り消しますか?')) return;
+      const r = cancelOrder(b.dataset.cancelOrder);
+      toast(r.msg); renderOrderManagementModal(); render();
+    };
+  });
+  modal.querySelectorAll('[data-modify-order]').forEach(b=>{
+    b.onclick = ()=>{ openOrderModifyModal(b.dataset.modifyOrder); };
+  });
+}
+function openOrderModifyModal(orderId){ showModal(); renderOrderModifyModal(orderId); }
+function renderOrderModifyModal(orderId){
+  const order = state.pendingOrders.find(o=>o.id===orderId);
+  const modal = document.getElementById('modal');
+  if(!order || order.status!=='pending'){ modal.innerHTML=`<div class="modal-handle"></div><div class="empty-state">この注文は変更できません</div>`; return; }
+  const st = state.stocks.find(s=>s.id===order.stockId);
+  const remaining = order.qty-(order.filledQty||0);
+  modal.innerHTML = `
+    <div class="modal-handle"></div>
+    <div class="modal-header"><div class="modal-title">注文変更</div><button class="modal-close" id="modal-close">✕</button></div>
+    <div style="font-size:11px; color:var(--muted); margin-bottom:8px; font-family:var(--font-wide);">${st?st.name:''} ・ 現在値 ¥${fmtNum(st?st.price:0)}</div>
+    <table class="dtable" style="margin-bottom:10px;">
+      <tr><td>現在の注文</td><td>${order.orderType==='limit'?`¥${fmtNum(order.limitPrice)}`:(order.orderType==='stop'?`¥${fmtNum(order.stopPrice)}`:'-')} × ${fmtNum(remaining)}株</td></tr>
+    </table>
+    <div class="price-input-row"><label>数量</label>
+      <div class="qty-stepper">
+        <button class="qty-btn" id="mod-qty-minus">−</button>
+        <input type="number" id="mod-qty-input" value="${remaining}" min="100" step="100">
+        <button class="qty-btn" id="mod-qty-plus">+</button>
+      </div>
+    </div>
+    ${order.orderType==='limit' ? `<div class="price-input-row"><label>指値価格</label><input type="number" id="mod-price-input" value="${order.limitPrice}"></div>` : ''}
+    ${order.orderType==='stop' ? `<div class="price-input-row"><label>逆指値価格</label><input type="number" id="mod-price-input" value="${order.stopPrice}"></div>` : ''}
+    <div id="mod-compare" style="font-size:11px; color:var(--muted); margin-top:10px; line-height:1.8; font-family:var(--font-wide);"></div>
+    <div class="buy-sell-row" style="margin-top:14px;">
+      <button class="btn btn-ghost btn-block" id="btn-modify-back">戻る</button>
+      <button class="btn btn-cyan btn-block" id="btn-modify-submit">変更を確定</button>
+    </div>
+  `;
+  modal.querySelector('#modal-close').onclick = ()=>{ openOrderManagementModal(); };
+  modal.querySelector('#btn-modify-back').onclick = ()=>{ openOrderManagementModal(); };
+  const qtyInput = modal.querySelector('#mod-qty-input');
+  const priceInput = modal.querySelector('#mod-price-input');
+  const compareEl = modal.querySelector('#mod-compare');
+  const updateCompare = ()=>{
+    const newQty = parseInt(qtyInput.value)||remaining;
+    const newPrice = priceInput ? (parseFloat(priceInput.value)||(order.orderType==='limit'?order.limitPrice:order.stopPrice)) : null;
+    const oldLabel = `${order.orderType==='limit'?`¥${fmtNum(order.limitPrice)}`:(order.orderType==='stop'?`¥${fmtNum(order.stopPrice)}`:'成行')} × ${fmtNum(remaining)}株`;
+    const newLabel = `${newPrice!==null?`¥${fmtNum(newPrice)}`:'成行'} × ${fmtNum(newQty)}株`;
+    compareEl.innerHTML = `現在<br><b style="color:var(--text);">${oldLabel}</b><br><br>変更後<br><b style="color:var(--cyan);">${newLabel}</b>`;
+  };
+  qtyInput.addEventListener('input', updateCompare);
+  if(priceInput) priceInput.addEventListener('input', updateCompare);
+  modal.querySelector('#mod-qty-minus').onclick = ()=>{ qtyInput.value=Math.max(TRADING_UNIT,(parseInt(qtyInput.value)||TRADING_UNIT)-TRADING_UNIT); updateCompare(); };
+  modal.querySelector('#mod-qty-plus').onclick = ()=>{ qtyInput.value=(parseInt(qtyInput.value)||0)+TRADING_UNIT; updateCompare(); };
+  updateCompare();
+  modal.querySelector('#btn-modify-submit').onclick = ()=>{
+    const changes = {qty: (order.filledQty||0)+(parseInt(qtyInput.value)||remaining)};
+    if(priceInput){ if(order.orderType==='limit') changes.limitPrice=parseFloat(priceInput.value); if(order.orderType==='stop') changes.stopPrice=parseFloat(priceInput.value); }
+    const r = modifyOrder(orderId, changes);
+    toast(r.msg);
+    if(r.ok){ openOrderManagementModal(); render(); }
+  };
+}
+
 function renderModalBoardTab(st){
   ensureBoardPosts(st);
   const score = computeStockSentiment(st);
@@ -6450,156 +7402,6 @@ function renderModalTechnicalTab(st){
   `;
 }
 
-/* ---------- 注文フォーム(成行/指値/逆指値/OCO) ---------- */
-function renderOrderForm(st, owned, availShares){
-  const form = document.getElementById('order-form');
-  const limitOK = canUseLimitOrders();
-  const stopOK = canUseStopOrders();
-  const ocoOK = canUseOCOOrders();
-
-  // 入力中だったドラフト(下書き)があれば復元する。銘柄を切り替えて戻ってきた場合や、
-  // モーダルを開き直した場合でも、直前に入力していた内容を維持する
-  const draft = orderFormDrafts[st.id];
-  if(draft && draft.orderType) orderFormType = draft.orderType;
-  const draftQty = draft && draft.qty!=null ? draft.qty : "100";
-  const draftLimitPrice = draft && draft.limitPrice!=null ? draft.limitPrice : Math.round(st.price);
-  const draftStopPrice = draft && draft.stopPrice!=null ? draft.stopPrice : Math.round(st.price);
-  const draftOcoLimit = draft && draft.ocoLimitPrice!=null ? draft.ocoLimitPrice : Math.round(st.price*1.1);
-  const draftOcoStop = draft && draft.ocoStopPrice!=null ? draft.ocoStopPrice : Math.round(st.price*0.9);
-
-  // 価格欄(注文方法に応じて内容が変わる。成行は現在値を参考表示するのみ)
-  let priceSection = "";
-  if(orderFormType==="market"){
-    priceSection = `<div class="price-input-row"><label>価格</label><div id="order-market-price-ref" style="flex:1; padding:7px 8px; color:var(--muted); font-family:var(--font); font-size:13px;">成行(現在値 ¥${fmtNum(st.price)})</div></div>`;
-  } else if(orderFormType==="limit"){
-    priceSection = `<div class="price-input-row"><label>価格</label><input type="number" id="in-limit-price" value="${draftLimitPrice}"></div>`;
-  } else if(orderFormType==="stop"){
-    priceSection = `<div class="price-input-row"><label>価格</label><input type="number" id="in-stop-price" value="${draftStopPrice}"></div>`;
-  } else if(orderFormType==="oco"){
-    priceSection = `
-      <div class="price-input-row"><label>利確価格</label><input type="number" id="in-oco-limit" value="${draftOcoLimit}"></div>
-      <div class="price-input-row"><label>損切価格</label><input type="number" id="in-oco-stop" value="${draftOcoStop}"></div>
-      <div style="font-size:10px; color:var(--muted-2); font-family:var(--font-wide); margin:-2px 0 6px;">OCO注文は保有株の売り専用です</div>
-    `;
-  }
-
-  form.innerHTML = `
-    <div style="font-size:9.5px; color:var(--muted-2); margin-bottom:4px; font-family:var(--font-wide);">注文方法</div>
-    <div class="toggle-row">
-      <button class="btn-toggle ${orderFormType==='market'?'active':''}" data-otype="market">成行</button>
-      <button class="btn-toggle ${orderFormType==='limit'?'active':''}" data-otype="limit" ${limitOK?'':'disabled'}>指値</button>
-      <button class="btn-toggle ${orderFormType==='stop'?'active':''}" data-otype="stop" ${stopOK?'':'disabled'}>逆指値</button>
-      <button class="btn-toggle ${orderFormType==='oco'?'active':''}" data-otype="oco" ${ocoOK?'':'disabled'}>OCO</button>
-    </div>
-    ${(!limitOK) ? '<div style="font-size:9.5px; color:var(--muted-2); margin-top:4px; font-family:var(--font-wide);">トレード部を設立すると指値/逆指値/OCO注文が使えます</div>' : ''}
-    <div style="height:10px;"></div>
-    ${priceSection}
-    <div class="price-input-row">
-      <label>数量</label>
-      <div class="qty-stepper">
-        <button class="qty-btn" id="qty-minus">−</button>
-        <input type="number" id="qty-input" value="${draftQty}" min="100" step="100">
-        <button class="qty-btn" id="qty-plus">+</button>
-      </div>
-    </div>
-    <table class="dtable" style="margin-top:8px;">
-      <tr><td>買付後の平均取得単価(参考)</td><td id="avgcost-preview">¥0</td></tr>
-      <tr><td>注文金額</td><td id="amount-display">¥0</td></tr>
-      <tr><td>必要資金(手数料込み)</td><td id="required-cash-display">¥0</td></tr>
-    </table>
-    <div style="font-size:9.5px; color:var(--muted-2); text-align:right; margin-top:3px; font-family:var(--font-wide);" id="avail-cash-display"></div>
-    <div class="buy-sell-row" style="margin-top:14px;">
-      <button class="btn btn-cyan btn-block" id="btn-buy">${orderFormType==='market'?'成行で購入':'買い注文を出す'}</button>
-      <button class="btn btn-red btn-block" id="btn-sell" ${owned?'':'disabled'}>${orderFormType==='market'?'成行で売却':(orderFormType==='oco'?'OCO注文を出す':'売り注文を出す')}</button>
-    </div>
-  `;
-
-  form.querySelectorAll('[data-otype]').forEach(b=>{
-    b.onclick=()=>{
-      if(b.disabled) return;
-      orderFormType=b.dataset.otype;
-      saveOrderFormDraft(st.id, form); // 種別を変える前の入力もいったん保存しておく
-      orderFormDrafts[st.id] = {...orderFormDrafts[st.id], orderType:orderFormType};
-      renderOrderForm(st, owned, availShares);
-    };
-  });
-
-  const qtyInput = form.querySelector('#qty-input');
-  const doUpdatePreview = ()=>{ updateOrderFormPreview(st, form); saveOrderFormDraft(st.id, form); };
-  doUpdatePreview();
-  qtyInput.addEventListener('input', doUpdatePreview);
-  form.querySelectorAll('input[type=number]').forEach(inp=> inp.addEventListener('input', doUpdatePreview));
-  form.querySelector('#qty-minus').onclick = ()=>{ qtyInput.value=Math.max(TRADING_UNIT,(parseInt(qtyInput.value)||TRADING_UNIT)-TRADING_UNIT); doUpdatePreview(); };
-  form.querySelector('#qty-plus').onclick = ()=>{ qtyInput.value=(parseInt(qtyInput.value)||0)+TRADING_UNIT; doUpdatePreview(); };
-
-  form.querySelector('#btn-buy').onclick = ()=>{
-    const qty = parseInt(qtyInput.value)||0;
-    let r;
-    if(orderFormType==="market"){ r = buyStock(st.id, qty); }
-    else if(orderFormType==="limit"){ const p=parseFloat(form.querySelector('#in-limit-price').value); r = placeOrder({stockId:st.id, side:"buy", orderType:"limit", qty, limitPrice:p, validityDays:30}); }
-    else if(orderFormType==="stop"){ const p=parseFloat(form.querySelector('#in-stop-price').value); r = placeOrder({stockId:st.id, side:"buy", orderType:"stop", qty, stopPrice:p, validityDays:30}); }
-    else { r = {ok:false, msg:"OCO注文は売り専用です"}; }
-    toast(r.msg);
-    if(r.ok){ clearOrderFormDraft(st.id); render(); renderStockModal(); }
-  };
-  form.querySelector('#btn-sell').onclick = ()=>{
-    const qty = parseInt(qtyInput.value)||0;
-    let r;
-    if(orderFormType==="market"){ r = sellStock(st.id, qty); }
-    else if(orderFormType==="limit"){ const p=parseFloat(form.querySelector('#in-limit-price').value); r = placeOrder({stockId:st.id, side:"sell", orderType:"limit", qty, limitPrice:p, validityDays:30}); }
-    else if(orderFormType==="stop"){ const p=parseFloat(form.querySelector('#in-stop-price').value); r = placeOrder({stockId:st.id, side:"sell", orderType:"stop", qty, stopPrice:p, validityDays:30}); }
-    else { const lp=parseFloat(form.querySelector('#in-oco-limit').value); const sp=parseFloat(form.querySelector('#in-oco-stop').value); r = placeOrder({stockId:st.id, side:"sell", orderType:"oco", qty, ocoLimitPrice:lp, ocoStopPrice:sp, validityDays:30}); }
-    toast(r.msg);
-    if(r.ok){ clearOrderFormDraft(st.id); render(); renderStockModal(); }
-  };
-
-}
-
-// 注文フォームのプレビュー値(注文金額・必要資金・平均取得単価)を更新する。入力欄の値そのものには一切触れない
-function updateOrderFormPreview(st, form){
-  const qtyInput = form.querySelector('#qty-input');
-  if(!qtyInput) return;
-  let qty = Math.max(TRADING_UNIT, parseInt(qtyInput.value)||0);
-  let refPrice = st.price;
-  if(orderFormType==="limit"){ const el=form.querySelector('#in-limit-price'); if(el) refPrice=parseFloat(el.value)||st.price; }
-  if(orderFormType==="stop"){ const el=form.querySelector('#in-stop-price'); if(el) refPrice=parseFloat(el.value)||st.price; }
-  const rawAmount = refPrice*qty;
-  const required = rawAmount*(1+feeRate());
-  const amountEl = form.querySelector('#amount-display');
-  const requiredEl = form.querySelector('#required-cash-display');
-  const availEl = form.querySelector('#avail-cash-display');
-  const avgCostEl = form.querySelector('#avgcost-preview');
-  if(amountEl) amountEl.textContent = fmtYen(rawAmount);
-  if(requiredEl) requiredEl.textContent = fmtYen(required);
-  if(availEl) availEl.textContent = `利用可能資金: ${fmtYen(availableCash())}`;
-  if(avgCostEl){
-    const pos = state.portfolio[st.id];
-    const existingShares = pos ? pos.shares : 0;
-    const existingCost = pos ? pos.avgCost : 0;
-    const newAvgCost = (existingCost*existingShares + refPrice*qty) / (existingShares+qty);
-    avgCostEl.textContent = `¥${fmtNum(newAvgCost)}`;
-  }
-  // 成行の場合、参考表示している現在値も最新化する(入力欄ではないため上書きしてよい)
-  const marketRefEl = form.querySelector('#order-market-price-ref');
-  if(marketRefEl && orderFormType==="market") marketRefEl.textContent = `成行(現在値 ¥${fmtNum(st.price)})`;
-}
-// 市場データ更新時に、注文フォームのプレビューだけを最新化する(入力中の値は変更しない)
-function refreshOrderFormPreview(st){
-  const form = document.getElementById('order-form');
-  if(!form) return;
-  updateOrderFormPreview(st, form);
-}
-// 現在の入力内容をドラフトとして保存する(銘柄を離れても、戻ってきた時に復元できるようにする)
-function saveOrderFormDraft(stockId, form){
-  const draft = {orderType: orderFormType};
-  const qtyInput = form.querySelector('#qty-input'); if(qtyInput) draft.qty = qtyInput.value;
-  const limitInput = form.querySelector('#in-limit-price'); if(limitInput) draft.limitPrice = limitInput.value;
-  const stopInput = form.querySelector('#in-stop-price'); if(stopInput) draft.stopPrice = stopInput.value;
-  const ocoLimitInput = form.querySelector('#in-oco-limit'); if(ocoLimitInput) draft.ocoLimitPrice = ocoLimitInput.value;
-  const ocoStopInput = form.querySelector('#in-oco-stop'); if(ocoStopInput) draft.ocoStopPrice = ocoStopInput.value;
-  orderFormDrafts[stockId] = {...orderFormDrafts[stockId], ...draft};
-}
-function clearOrderFormDraft(stockId){ delete orderFormDrafts[stockId]; }
 
 /* ==========================================================================
    UI操作(モーダル・トースト・タブ切替)
@@ -6628,7 +7430,7 @@ function toast(msg){
    チュートリアル
    ========================================================================== */
 const TUTORIAL_STEPS = [
-  {title:"ようこそ、キャピタル・ターミナルへ", body:`あなたは一人の投資家です。資本金<b>100万円</b>からスタートし、次の大化け企業を発掘し、自らの手で世界を代表する企業を誕生させることを目指します。<br><br><b>企業を分析する→投資する→企業が成長する→株価が上がる→さらに投資する</b>、この流れが中心の本格株式トレードシミュレーションです。`},
+  {title:"ようこそ、キャピタル・ターミナルへ", body:`あなたは一人の投資家です。資本金<b>1,000万円</b>からスタートし、次の大化け企業を発掘し、自らの手で世界を代表する企業を誕生させることを目指します。<br><br><b>企業を分析する→投資する→企業が成長する→株価が上がる→さらに投資する</b>、この流れが中心の本格株式トレードシミュレーションです。`},
   {title:"① 日経平均と相場サイクル", body:`日経平均は65,000円前後を基準に、平均回帰しながら長期的にはゆるやかに上昇していきます。<br><br>相場には<b>上昇相場・下降相場・レンジ相場・バブル相場・暴落相場</b>のサイクルがあり、上部の「相場局面」で確認できます。個別株にも、過熱すれば調整が入る値動きが再現されています。`},
   {title:"② 銘柄を分析する", body:`銘柄詳細には<b>チャート・四季報・適時開示・分析・掲示板</b>の5つのタブがあります。四季報では業績やPER・PBR・大株主構成を、適時開示では決算や増資・自社株買いなどの発表を、掲示板では様々なタイプの投資家の声(市場センチメント)を確認できます。`},
   {title:"③ 注文と値動き", body:`売買は<b>100株単位</b>です。成行に加え、トレード部を設立すると指値・逆指値・OCO注文も使えます。大量注文は出来高に対する比率に応じて株価に影響し、出来高を超える注文は<b>一部約定</b>となることがあります。`},
@@ -7076,6 +7878,120 @@ document.getElementById('btn-debug-menu').addEventListener('click', openDebugPan
 /* ==========================================================================
    12. 初期化
    ========================================================================== */
+// ==========================================================================
+// オフライン・キャッチアップシミュレーション
+// (「ブラウザを開いていない間も本物のサーバーで処理が動き続ける」ことは、window.storage/localStorage
+//  しか持たないこのアーキテクチャでは実現できない。代わりに、実世界の経過時間を最後の保存時刻から算出し、
+//  再訪時にその分のゲーム内日数を一括シミュレーションすることで、同等のプレイ体験を実現する)
+// ==========================================================================
+const OFFLINE_HOURS_PER_GAME_DAY = 1; // 現実の1時間 = ゲーム内1日 に相当する換算レート
+const OFFLINE_MAX_CATCHUP_DAYS = 365; // 1回のキャッチアップで詳細シミュレーションする上限日数(処理が重くならないようにする)
+function runOfflineCatchup(){
+  if(!state.lastWallClockTime){
+    state.lastWallClockTime = new Date().toISOString();
+    return null; // 初回起動時は経過時間を計算しない
+  }
+  const lastTime = new Date(state.lastWallClockTime).getTime();
+  const now = Date.now();
+  const elapsedMs = Math.max(0, now - lastTime);
+  const elapsedHours = elapsedMs/1000/60/60;
+  if(elapsedHours < 0.05){ // 数分未満の再読み込み等は無視する
+    state.lastWallClockTime = new Date().toISOString();
+    return null;
+  }
+  let gameDaysToSimulate = Math.floor(elapsedHours/OFFLINE_HOURS_PER_GAME_DAY);
+  let capped = false;
+  if(gameDaysToSimulate > OFFLINE_MAX_CATCHUP_DAYS){ gameDaysToSimulate = OFFLINE_MAX_CATCHUP_DAYS; capped = true; }
+  if(gameDaysToSimulate<=0){
+    state.lastWallClockTime = new Date().toISOString();
+    return null;
+  }
+
+  const dayBeforeCatchup = state.day;
+  const nwBefore = netWorth();
+  const nikkeiBefore = state.nikkei;
+  const portfolioSnapshot = {};
+  Object.keys(state.portfolio).forEach(id=>{ portfolioSnapshot[id]=state.portfolio[id].shares; });
+  const priceSnapshot = {};
+  state.stocks.forEach(s=>{ priceSnapshot[s.id]=s.price; });
+  const marginPositionIdsBefore = new Set(state.marginPositions.map(p=>p.id));
+  const marginCallBefore = !!state.marginCall;
+
+  suppressAutoSave = true;
+
+  for(let i=0;i<gameDaysToSimulate;i++){
+    try{ advanceDay(); } catch(e){ console.error("オフラインシミュレーション中にエラーが発生しました:", e); break; }
+  }
+  suppressAutoSave = false;
+
+  state.lastWallClockTime = new Date().toISOString();
+  saveState(); // ここで初めて実際に1回だけ保存する
+
+  const nwAfter = netWorth();
+  // 経過中に発生したニュースは「日付がキャッチアップ開始日より後」のものとして正確に抽出する(配列の上限による古い記事の消失に影響されない)
+  const offlineNews = state.news.filter(n=>n.day>dayBeforeCatchup);
+  const holdingIds = new Set(Object.keys(portfolioSnapshot));
+  const ventureStockIds = new Set(state.ventures.filter(v=>v.listedStockId).map(v=>v.listedStockId));
+  const highlightNews = offlineNews.filter(n=> n.stars>=4 || (n.stockId && (holdingIds.has(n.stockId)||ventureStockIds.has(n.stockId)))).slice(0,15);
+
+  const movers = Object.keys(portfolioSnapshot).map(id=>{
+    const st = state.stocks.find(s=>s.id===id);
+    if(!st || !priceSnapshot[id]) return null;
+    return {name:st.name, pct:(st.price/priceSnapshot[id]-1)*100};
+  }).filter(Boolean).sort((a,b)=>Math.abs(b.pct)-Math.abs(a.pct)).slice(0,5);
+
+  const newMarginPositions = state.marginPositions.filter(p=>!marginPositionIdsBefore.has(p.id)).length;
+  const marginCallOccurred = !marginCallBefore && (!!state.marginCall || offlineNews.some(n=>n.category==='margin'));
+
+  return {
+    elapsedMs, elapsedHours, gameDaysSimulated: gameDaysToSimulate, capped,
+    dayBeforeCatchup, dayAfter: state.day,
+    nwBefore, nwAfter, nwChange: nwAfter-nwBefore,
+    nikkeiBefore, nikkeiAfter: state.nikkei, nikkeiChangePct: nikkeiBefore>0 ? (state.nikkei/nikkeiBefore-1)*100 : 0,
+    highlightNews, movers, totalNewsCount: offlineNews.length,
+    newMarginPositions, marginCallOccurred,
+  };
+}
+function formatElapsedTime(ms){
+  const totalMinutes = Math.floor(ms/1000/60);
+  const days = Math.floor(totalMinutes/60/24);
+  const hours = Math.floor((totalMinutes/60)%24);
+  const minutes = totalMinutes%60;
+  if(days>0) return `${days}日${hours}時間${minutes}分`;
+  if(hours>0) return `${hours}時間${minutes}分`;
+  return `${minutes}分`;
+}
+function openOfflineSummaryModal(summary){
+  showModal();
+  const modal = document.getElementById('modal');
+  const nwSign = summary.nwChange>=0 ? '+' : '';
+  modal.innerHTML = `
+    <div class="modal-handle"></div>
+    <div style="text-align:center; padding:14px 0 8px;">
+      <div style="font-size:15px; font-weight:800; font-family:var(--font-wide);">あなたが不在の間に起きたこと</div>
+      <div style="font-size:11px; color:var(--muted); margin-top:6px; font-family:var(--font-wide);">経過時間 ${formatElapsedTime(summary.elapsedMs)} ・ ゲーム内${fmtNum(summary.gameDaysSimulated)}日分をシミュレーションしました</div>
+      ${summary.capped ? `<div style="font-size:10px; color:var(--amber); margin-top:4px; font-family:var(--font-wide);">※長期間の不在のため、直近${OFFLINE_MAX_CATCHUP_DAYS}日分のみ詳細にシミュレーションしています</div>` : ''}
+    </div>
+    <table class="dtable">
+      <tr><td>📈 日経平均</td><td style="color:${summary.nikkeiChangePct>=0?'var(--green)':'var(--red)'};">${fmtPct(summary.nikkeiChangePct)}</td></tr>
+      <tr><td>💰 あなたの総資産</td><td style="color:${summary.nwChange>=0?'var(--green)':'var(--red)'};">${nwSign}${fmtYen(summary.nwChange)}</td></tr>
+      ${summary.movers.map(m=>`<tr><td>${m.pct>=0?'🔥':'⚠'} ${m.name}</td><td style="color:${m.pct>=0?'var(--green)':'var(--red)'};">${fmtPct(m.pct)}</td></tr>`).join("")}
+      ${summary.newMarginPositions>0 ? `<tr><td>📋 信用取引</td><td>新規建玉 ${summary.newMarginPositions}件</td></tr>` : ''}
+      ${summary.marginCallOccurred ? `<tr><td>⚠ 追証</td><td style="color:var(--red);">発生しています</td></tr>` : ''}
+    </table>
+    <div style="height:10px;"></div>
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>主なニュース</h2><span class="sub">全${summary.totalNewsCount}件</span></div>
+    ${summary.highlightNews.length ? summary.highlightNews.map(n=>`
+      <div class="row" style="cursor:default;">
+        <div class="row-left"><div class="nm" style="font-size:11.5px; line-height:1.5;">${n.text}</div><div class="sub">${fmtDateShort(n.day)}</div></div>
+      </div>
+    `).join("") : `<div class="empty-state">大きな出来事はありませんでした</div>`}
+    <div style="height:14px;"></div>
+    <button class="btn btn-cyan btn-block" id="btn-offline-summary-close">閉じる</button>
+  `;
+  modal.querySelector('#btn-offline-summary-close').onclick = ()=>{ closeModal(); if(!state.tutorialSeen) openTutorial(); };
+}
+
 async function boot(){
   const result = await loadState();
   if(result.ok){
@@ -7094,10 +8010,12 @@ async function boot(){
     state = initState();
   }
   migrateState();
+  const offlineSummary = runOfflineCatchup();
   render();
   startGameLoop();
   startPeriodicAutosave();
   if(needsPlayerName()) openPlayerNameModal();
+  else if(offlineSummary) openOfflineSummaryModal(offlineSummary);
   else if(!state.tutorialSeen) openTutorial();
 }
 // 読み込んだセーブデータに不足しているフィールドを補完する(通常モード・デバッグモード共通で利用)
@@ -7110,6 +8028,12 @@ function migrateState(){
   if(!state.orderHistory) state.orderHistory=[];
   if(!state.pendingRumors) state.pendingRumors=[];
   if(!state.pendingOrders) state.pendingOrders=[];
+  else state.pendingOrders.forEach(o=>{
+    if(o.filledQty===undefined) o.filledQty = o.status==="filled" ? o.qty : 0;
+    if(o.tradeCategory===undefined) o.tradeCategory = "spot";
+    if(o.marginAction===undefined) o.marginAction = null;
+    if(o.positionId===undefined) o.positionId = null;
+  });
   if(state.reservedCash===undefined) state.reservedCash=0;
   if(!state.nikkei) state.nikkei=65000;
   if(!state.nikkeiHistory) state.nikkeiHistory=[{o:state.nikkei||65000,h:state.nikkei||65000,l:state.nikkei||65000,c:state.nikkei||65000,day:state.day}];
@@ -7145,7 +8069,33 @@ function migrateState(){
   if(!state.rivals || !state.rivals.length) state.rivals=generateRivals();
   if(state.activeTob===undefined) state.activeTob=null;
   if(!state.pendingBoardReactions) state.pendingBoardReactions=[];
+  if(!state.marginAccount) state.marginAccount={opened:false, openedDay:null};
+  if(!state.marginPositions) state.marginPositions=[];
+  if(state.marginCall===undefined) state.marginCall=null;
   if(!state.globalCompanies || !state.globalCompanies.length) state.globalCompanies=generateGlobalCompanies();
+  else state.globalCompanies.forEach(g=>{
+    // 旧バージョン(単純ランダムウォーク方式)のデータを、新しい理論企業価値ベースの構造へ安全に移行する
+    if(g.revenue===undefined){
+      // 破損・異常値化している可能性のあるcapCurrentではなく、安定した設計時点の値(baseCap)から補完する
+      const impliedProfit = Math.max(1e9, (g.baseCap||1e12)/15);
+      g.baseRevenue = g.baseRevenue!==undefined ? g.baseRevenue : impliedProfit*6;
+      g.baseProfit = g.baseProfit!==undefined ? g.baseProfit : impliedProfit;
+      g.revenue = g.baseRevenue;
+      g.profit = impliedProfit;
+      g.growth = g.growth!==undefined ? g.growth : rand(3,10);
+      g.quality = g.quality!==undefined ? g.quality : rand(0.45,0.65);
+      g.stage = g.stage||"mature";
+      g.bornDay = g.bornDay||1;
+      g.deathDay = g.deathDay!==undefined ? g.deathDay : null;
+      g.sector = g.sector||"製造業";
+      g.id = g.id || ("gc_legacy_"+g.name);
+      // 旧データの時価総額が異常値になっている場合は、理論企業価値まで安全に補正する(既存の相対順位はできるだけ尊重する)
+      const fv = globalCompanyFairValue(g);
+      if(!isFinite(g.capCurrent) || g.capCurrent<=0 || g.capCurrent > fv*50){
+        g.capCurrent = fv;
+      }
+    }
+  });
   if(!state.legendaryFeats) state.legendaryFeats={tenbagger:false, oku100:false, oku1000:false, ipoSuccess:false, worldClassCompany:false, marketDominator:false};
   if(!state.pendingCelebrations) state.pendingCelebrations=[];
   state.ventures.forEach(v=>{
