@@ -3667,6 +3667,379 @@ function divestNewBusiness(ventureId, businessId){
   return {ok:true, msg:"事業を撤退しました"};
 }
 
+/* ==========================================================================
+   企業提携(業務提携・技術提携・資本提携・共同研究・販売提携・海外提携)
+   ========================================================================== */
+const ALLIANCE_TYPES = {
+  business:  {label:"業務提携", desc:"事業運営面での協力関係を築く"},
+  tech:      {label:"技術提携", desc:"技術力・研究開発力を高め合う"},
+  capital:   {label:"資本提携", desc:"互いに株式を持ち合い関係を強化する(M&Aへの布石にもなる)"},
+  rd:        {label:"共同研究", desc:"新技術・新製品を共同開発する"},
+  sales:     {label:"販売提携", desc:"互いの販売網・市場シェアを活用する"},
+  overseas:  {label:"海外提携", desc:"海外市場への進出を協力して進める"},
+};
+// 提携候補企業の一覧(自社が経営していない独立した公開企業から抽出する)
+function getAlliancePartnerCandidates(){
+  return state.stocks.filter(s=>!state.ventures.some(v=>v.listedStockId===s.id)).map(s=>({
+    id:s.id, name:s.name, sector:s.sector,
+    techScore: Math.round(s.quality*100), salesScore: Math.round(clamp((s.floatRatio||0.5)*60+s.quality*40,10,95)),
+    capitalScore: Math.round(clamp(Math.log10(Math.max(1,s.price*s.shares))*8,10,95)),
+    overseasScore: Math.round(clamp(s.growth*3+30,10,90)),
+  }));
+}
+function proposeAlliance(ventureId, partnerId, allianceType, terms){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v || (v.stage!=="private" && v.stage!=="listed")) return {ok:false, msg:"この企業は提携を結べません"};
+  if(!ALLIANCE_TYPES[allianceType]) return {ok:false, msg:"不正な提携種別です"};
+  if(!v.alliances) v.alliances=[];
+  if(v.alliances.some(a=>a.partnerId===partnerId && a.active)) return {ok:false, msg:"すでにこの企業と提携しています"};
+  const exclusive = !!(terms&&terms.exclusive);
+  if(exclusive && v.alliances.some(a=>a.active && a.exclusive)) return {ok:false, msg:"独占提携中は他社との新たな提携を結べません"};
+  const partner = state.stocks.find(s=>s.id===partnerId);
+  if(!partner) return {ok:false, msg:"提携先が見つかりません"};
+  const ownStake = clamp((terms&&terms.ownStake)!==undefined ? terms.ownStake : 50, 10, 90);
+  const successProb = clamp(0.55 + (v.quality-0.5)*0.3 + (ownStake>=40&&ownStake<=60?0.05:-0.05), 0.15, 0.85);
+  const success = Math.random()<successProb;
+  if(!success){
+    pushNews(`${v.name}は${partner.name}との${ALLIANCE_TYPES[allianceType].label}交渉が不成立に終わった。`, {stars:2, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+    saveState();
+    return {ok:true, msg:"交渉は不成立に終わりました", success:false};
+  }
+  const alliance = {id:"al"+Date.now()+randInt(0,999), partnerId, partnerName:partner.name, type:allianceType, exclusive, ownStake, startDay:state.day, active:true};
+  v.alliances.push(alliance);
+  // 提携効果: 相手の強みを一部だけ自社に反映する(即座に全部ではなく、緩やかに)
+  const techGain = Math.max(0,(partner.quality-v.quality))*0.4;
+  v.quality = clamp(v.quality+techGain, 0.05, 0.97);
+  if(allianceType==="sales") v.marketShare = clamp((v.marketShare||5)+rand(1,4), 0, 100);
+  if(allianceType==="overseas") v.overseasRegions = [...(v.overseasRegions||[]), `${partner.name}経由の海外市場`];
+  if(allianceType==="rd" || allianceType==="tech"){ const t=ventureTarget(v); t.growth = clamp(t.growth+rand(0.5,2), -15, 45); }
+  if(!v.history) v.history=[];
+  v.history.push({day:state.day, text:`${partner.name}と${ALLIANCE_TYPES[allianceType].label}を締結`});
+  pushNews(`${v.name}が${partner.name}と${ALLIANCE_TYPES[allianceType].label}を締結した。`, {stars:4, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+  saveState();
+  return {ok:true, msg:`${partner.name}と${ALLIANCE_TYPES[allianceType].label}を締結しました`, success:true};
+}
+function dissolveAlliance(ventureId, allianceId){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v) return {ok:false, msg:"対象企業が見つかりません"};
+  const alliance = (v.alliances||[]).find(a=>a.id===allianceId && a.active);
+  if(!alliance) return {ok:false, msg:"提携が見つかりません"};
+  alliance.active = false;
+  alliance.endDay = state.day;
+  if(!v.history) v.history=[];
+  v.history.push({day:state.day, text:`${alliance.partnerName}との提携を解消`});
+  pushNews(`${v.name}と${alliance.partnerName}の提携が解消された。`, {stars:3, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+  saveState();
+  return {ok:true, msg:"提携を解消しました"};
+}
+// 提携先の業績悪化・上場廃止などにより、低確率で提携が自動的に解消される
+function updateAlliances(v){
+  if(!v.alliances || !v.alliances.length) return;
+  v.alliances.forEach(a=>{
+    if(!a.active) return;
+    const partner = state.stocks.find(s=>s.id===a.partnerId);
+    if(!partner){ a.active=false; a.endDay=state.day; return; } // 上場廃止等で消滅
+    const health = computeCompanyHealthStatus(partner);
+    const dissolveChance = health.level==="crisis" ? 0.0015 : (health.level==="bankruptcy_risk" ? 0.004 : 0.00015);
+    if(Math.random()<dissolveChance){
+      a.active=false; a.endDay=state.day;
+      if(!v.history) v.history=[];
+      v.history.push({day:state.day, text:`${a.partnerName}の業績悪化により提携が解消された`});
+      pushNews(`${v.name}と${a.partnerName}の提携が、${a.partnerName}の業績悪化を理由に解消された。`, {stars:3, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+    }
+  });
+}
+// 事業ポートフォリオ(売上構成)を算出する。主力事業+育成中の新規事業のうち、売上を持つものを集計する
+function computeBusinessPortfolio(v){
+  const t = ventureTarget(v);
+  const sportsRevTotal = (v.sportsTeams||[]).reduce((s,team)=> s + (team.status!=="sold"?(team.revenue||0)*0.3:0), 0);
+  const items = [{label:v.sector+"(既存事業)", revenue: Math.max(0, t.revenue - (v.newBusinesses||[]).reduce((s,b)=> s + (b.stage!=="failed"?(b.revenue||0)*0.3:0), 0) - sportsRevTotal)}];
+  (v.newBusinesses||[]).forEach(b=>{
+    if(b.stage!=="failed" && (b.revenue||0)>0){
+      const sector = NEW_BUSINESS_SECTORS.find(s=>s.key===b.sectorKey);
+      items.push({label:(sector?sector.label:b.label)+"(新規事業)", revenue: b.revenue*0.3});
+    }
+  });
+  (v.sportsTeams||[]).forEach(team=>{
+    if(team.status!=="sold" && (team.revenue||0)>0) items.push({label:`${SPORT_TYPES[team.sport].label}:${team.name}`, revenue: team.revenue*0.3});
+  });
+  const total = items.reduce((s,i)=>s+i.revenue,0)||1;
+  return items.map(i=>({...i, pct: i.revenue/total*100})).sort((a,b)=>b.revenue-a.revenue);
+}
+
+/* ==========================================================================
+   スポーツ・eスポーツ事業経営(親会社の1事業として、既存の新規事業システムと同じ「業績への
+   ダンピング付き寄与」パターンで連携する。固定の株価ボーナスは一切与えず、売上・利益として
+   ventureTarget(v)へ反映することで、既存のファンダメンタルズ→株価システムに自然に接続する)
+   ========================================================================== */
+const SPORT_TYPES = {
+  baseball:   {label:"プロ野球",       acquireRange:[100e9,300e9], foundCost:150e9, seasonDays:180, rosterSize:9},
+  soccer:     {label:"サッカー",       acquireRange:[80e9,200e9],  foundCost:100e9, seasonDays:150, rosterSize:11, hasYouth:true},
+  basketball: {label:"バスケットボール", acquireRange:[20e9,60e9],  foundCost:30e9,  seasonDays:120, rosterSize:5},
+  esports:    {label:"eスポーツ",      acquireRange:[2e9,8e9],     foundCost:3e9,   seasonDays:90,  rosterSize:5},
+};
+const ESPORTS_TITLES_INITIAL = [
+  {key:"fps_valo", label:"ヴァロシューター", genre:"FPS", popularity:70},
+  {key:"fps_cs",   label:"タクティカルストライク", genre:"FPS", popularity:55},
+  {key:"moba",     label:"レジェンズバトル", genre:"MOBA", popularity:80},
+  {key:"br",       label:"サバイバルロワイヤル", genre:"バトルロイヤル", popularity:60},
+  {key:"fighting", label:"ソウルファイター", genre:"格闘ゲーム", popularity:35},
+];
+const TEAM_NAME_PARTS = {prefix:["東京","大阪","横浜","名古屋","福岡","札幌","仙台","広島","湾岸","中央"], suffix:["ドラゴンズ","フェニックス","タイタンズ","サンダース","ブレイブス","ユニコーンズ","ヴィクトリーズ","レイヴンズ"]};
+const PLAYER_NAME_PARTS = {last:["山田","鈴木","田中","佐藤","高橋","渡辺","伊藤","中村","小林","加藤"], first:["翔太","健太","大輔","颯","陸","蓮","悠斗","樹","一輝","颯太"]};
+
+function ensureEsportsTitles(){
+  if(!state.esportsTitles) state.esportsTitles = ESPORTS_TITLES_INITIAL.map(t=>({...t}));
+}
+function generatePlayer(sport){
+  const skill = Math.round(rand(40,75));
+  return {
+    id:"pl"+Date.now()+randInt(0,9999),
+    name: pick(PLAYER_NAME_PARTS.last)+pick(PLAYER_NAME_PARTS.first),
+    age: sport==="esports" ? randInt(16,22) : randInt(18,26),
+    skill, potential: Math.round(clamp(skill+rand(0,30),0,99)),
+    morale: 70, marketValue: Math.round(skill*skill*1_000_000*(sport==="esports"?0.3:8)),
+    salary: Math.round(skill*skill*100_000*(sport==="esports"?0.2:3)),
+    contractYearsLeft: randInt(2,5),
+    careerStage: "rookie",
+  };
+}
+function generateRoster(sport){
+  const size = SPORT_TYPES[sport].rosterSize + 3; // 控え選手も含む
+  return Array.from({length:size}, ()=>generatePlayer(sport));
+}
+function computeTeamStrength(team){
+  const roster = team.roster||[];
+  if(!roster.length) return 30;
+  const avgSkill = avg(roster.map(p=>p.skill));
+  const facilityBonus = ((team.facilities.training||0) + (team.facilities.stadium||0)*0.3)/3;
+  return clamp(avgSkill + facilityBonus, 10, 99);
+}
+// チーム買収(既存の架空チームプール的な発想で、資金力に応じたランダムなチームを提示する簡易実装)
+function foundSportsTeam(ventureId, sport, teamName){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v || (v.stage!=="private" && v.stage!=="listed")) return {ok:false, msg:"この企業はスポーツ事業を持てません"};
+  if(!SPORT_TYPES[sport]) return {ok:false, msg:"不正な競技です"};
+  const cost = SPORT_TYPES[sport].foundCost;
+  if(availableCash()<cost) return {ok:false, msg:"設立資金が不足しています"};
+  state.cash -= cost;
+  ensureEsportsTitles();
+  const team = {
+    id:"team"+Date.now()+randInt(0,9999), sport, name: teamName || `${pick(TEAM_NAME_PARTS.prefix)}${pick(TEAM_NAME_PARTS.suffix)}`,
+    method:"founded", acquireDay:state.day, status:"active",
+    fanbase: 15, loyalty: 40, standing: null,
+    revenue:0, profit:0, lastSeasonDay: state.day,
+    facilities:{stadium:10, training:10, youth: sport==="soccer"?10:undefined},
+    ticketPrice:50, sponsors:[], namingRights:null,
+    esportsTitle: sport==="esports" ? pick(state.esportsTitles).key : null,
+    roster: generateRoster(sport), history:[{day:state.day, text:`${teamName||"新チーム"}を新規設立した`}],
+  };
+  if(!v.sportsTeams) v.sportsTeams=[];
+  v.sportsTeams.push(team);
+  pushNews(`${v.name}が${SPORT_TYPES[sport].label}事業へ新規参入し、「${team.name}」を設立した。`, {stars:4, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+  saveState();
+  return {ok:true, msg:`${team.name}を設立しました`, teamId:team.id};
+}
+function acquireSportsTeam(ventureId, sport){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v || (v.stage!=="private" && v.stage!=="listed")) return {ok:false, msg:"この企業はスポーツ事業を持てません"};
+  if(!SPORT_TYPES[sport]) return {ok:false, msg:"不正な競技です"};
+  const cost = Math.round(rand(SPORT_TYPES[sport].acquireRange[0], SPORT_TYPES[sport].acquireRange[1]));
+  if(availableCash()<cost) return {ok:false, msg:`買収資金が不足しています(必要額目安 ${fmtYen(cost)})`};
+  state.cash -= cost;
+  ensureEsportsTitles();
+  const existingFanbase = Math.round(rand(30,65)); // 既存チームは一定のファン基盤を持つ
+  const team = {
+    id:"team"+Date.now()+randInt(0,9999), sport, name: `${pick(TEAM_NAME_PARTS.prefix)}${pick(TEAM_NAME_PARTS.suffix)}`,
+    method:"acquired", acquireDay:state.day, status:"active",
+    fanbase: existingFanbase, loyalty: Math.round(rand(50,80)), standing: null,
+    revenue:0, profit:0, lastSeasonDay: state.day,
+    facilities:{stadium: Math.round(rand(30,60)), training: Math.round(rand(30,60)), youth: sport==="soccer"?Math.round(rand(20,50)):undefined},
+    ticketPrice:80, sponsors:[], namingRights:null,
+    esportsTitle: sport==="esports" ? pick(state.esportsTitles).key : null,
+    roster: generateRoster(sport), history:[{day:state.day, text:`${fmtYen(cost)}で買収した`}],
+  };
+  if(!v.sportsTeams) v.sportsTeams=[];
+  v.sportsTeams.push(team);
+  pushNews(`${v.name}が${SPORT_TYPES[sport].label}チーム「${team.name}」を${fmtYen(cost)}で買収した。`, {stars:5, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+  saveState();
+  return {ok:true, msg:`${team.name}を買収しました`, teamId:team.id};
+}
+// 施設投資(スタジアム/練習施設/ユースアカデミー)
+function investInTeamFacility(ventureId, teamId, facilityKey, amount){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v) return {ok:false, msg:"対象企業が見つかりません"};
+  const team = (v.sportsTeams||[]).find(t=>t.id===teamId && t.status==="active");
+  if(!team) return {ok:false, msg:"対象チームが見つかりません"};
+  if(!["stadium","training","youth"].includes(facilityKey)) return {ok:false, msg:"不正な施設です"};
+  if(facilityKey==="youth" && team.sport!=="soccer") return {ok:false, msg:"ユースアカデミーはサッカーのみ設置できます"};
+  if(!amount || amount<=0) return {ok:false, msg:"金額を入力してください"};
+  if((v.cashBalance||0)<amount) return {ok:false, msg:"企業の現金が不足しています"};
+  v.cashBalance -= amount;
+  team.facilities[facilityKey] = clamp((team.facilities[facilityKey]||0) + amount/1e9*3, 0, 100);
+  saveState();
+  return {ok:true, msg:"施設に投資しました"};
+}
+// スポンサー獲得(親会社の業種との相性でスポンサー料が変わる)
+const SPONSOR_FIT = {
+  "半導体":{esports:1.6, baseball:0.8, soccer:0.9, basketball:0.9}, "IT":{esports:1.5, soccer:1.3, basketball:1.1, baseball:0.9},
+  "食品":{baseball:1.4, soccer:1.1, basketball:1.0, esports:0.8}, "自動車":{basketball:1.0, soccer:1.2, baseball:1.0, esports:0.9},
+  "金融":{baseball:1.1, soccer:1.1, basketball:1.1, esports:1.0}, "防衛":{baseball:0.9,soccer:0.9,basketball:0.9,esports:0.9},
+};
+function seekSponsor(ventureId, teamId){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v) return {ok:false, msg:"対象企業が見つかりません"};
+  const team = (v.sportsTeams||[]).find(t=>t.id===teamId && t.status==="active");
+  if(!team) return {ok:false, msg:"対象チームが見つかりません"};
+  const fitTable = SPONSOR_FIT[v.sector] || {};
+  const fitScore = fitTable[team.sport] || 1.0;
+  const strength = computeTeamStrength(team);
+  const baseAmount = (team.sport==="esports" ? 0.3e9 : 3e9) * (strength/60) * (team.fanbase/40);
+  const amount = Math.round(baseAmount * fitScore * rand(0.8,1.3));
+  if(Math.random()<0.25){
+    pushNews(`${team.name}のスポンサー獲得交渉がまとまらなかった。`, {stars:2, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+    saveState();
+    return {ok:true, msg:"スポンサー獲得には至りませんでした", success:false};
+  }
+  team.sponsors.push({id:"sp"+Date.now()+randInt(0,999), amount, fitScore, startDay:state.day});
+  pushNews(`${team.name}が新たなスポンサー契約を獲得した(年間${fmtYen(amount)})。`, {stars:3, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+  saveState();
+  return {ok:true, msg:`スポンサー契約を獲得しました(年間${fmtYen(amount)})`, success:true};
+}
+// ネーミングライツ(スタジアムのある野球/サッカー/バスケットボールチームのみ)
+function sellNamingRights(ventureId, teamId, newName){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v) return {ok:false, msg:"対象企業が見つかりません"};
+  const team = (v.sportsTeams||[]).find(t=>t.id===teamId && t.status==="active");
+  if(!team) return {ok:false, msg:"対象チームが見つかりません"};
+  if(team.sport==="esports") return {ok:false, msg:"eスポーツにはスタジアムのネーミングライツはありません"};
+  const amount = Math.round(team.facilities.stadium*1e8*rand(0.8,1.3));
+  team.namingRights = {name:newName||`${team.name}アリーナ`, amount, startDay:state.day};
+  v.cashBalance = (v.cashBalance||0)+amount;
+  pushNews(`${team.name}の本拠地に命名権が設定され、「${team.namingRights.name}」として${fmtYen(amount)}の収益を得た。`, {stars:3, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+  saveState();
+  return {ok:true, msg:`命名権を売却しました(${fmtYen(amount)})`};
+}
+// シーズン処理: 成績決定→ファン増減→収益計算(チケット・グッズ・スポンサー)→維持費控除→親会社業績への反映
+function processTeamSeason(v, team){
+  const strength = computeTeamStrength(team);
+  const rivalStrength = clamp(strength + rand(-15,15), 10, 99); // 簡易的なライバルチームとの対戦結果
+  const won = strength > rivalStrength;
+  team.standing = clamp((team.standing||8) + (won ? -randInt(0,2) : randInt(0,2)), 1, 12);
+
+  // ファンの増減(成績連動だが、ロイヤルティが高いほど下振れを緩和する)
+  const perfDelta = won ? rand(1,4) : rand(-4,-0.5);
+  team.fanbase = clamp(team.fanbase + perfDelta*(1-team.loyalty/200), 2, 100);
+  team.loyalty = clamp(team.loyalty + (won?0.5:-0.2), 10, 95);
+
+  // 収益: チケット・グッズ(ファン規模とチケット単価に依存)+スポンサー収入
+  const attendanceFactor = clamp(team.fanbase/100, 0.05, 1) * clamp((team.facilities.stadium||10)/100+0.3, 0.3, 1.2);
+  const ticketRevenue = attendanceFactor * (team.ticketPrice||50) * 800_000;
+  const goodsRevenue = attendanceFactor * 300_000_000 * (team.fanbase/60);
+  const sponsorRevenue = (team.sponsors||[]).reduce((s,sp)=>s+sp.amount,0);
+  const namingRevenue = team.namingRights ? team.namingRights.amount*0.1 : 0;
+  const esportsTitleFactor = team.sport==="esports" ? (()=>{ ensureEsportsTitles(); const title=state.esportsTitles.find(t=>t.key===team.esportsTitle); return title?title.popularity/60:1; })() : 1;
+  team.revenue = Math.round((ticketRevenue+goodsRevenue+sponsorRevenue+namingRevenue) * esportsTitleFactor);
+
+  // 維持費: 選手年俸+施設維持費(現金を大量保有していても無敵にならないようにする)
+  const salaryCost = (team.roster||[]).reduce((s,p)=>s+p.salary,0);
+  const facilityCost = ((team.facilities.stadium||0)+(team.facilities.training||0)+(team.facilities.youth||0))*5_000_000;
+  const totalCost = salaryCost + facilityCost;
+  team.profit = team.revenue - totalCost;
+
+  // 親会社の業績への反映(新規事業と同じ0.3ダンピングパターン。固定の株価ボーナスは一切与えない)
+  const t = ventureTarget(v);
+  t.revenue += team.revenue*0.3;
+  t.profit += team.profit*0.3;
+
+  // まれにスキャンダル発生(ファンの信頼・スポンサー評価を損なう)
+  if(Math.random()<0.02){
+    team.fanbase = clamp(team.fanbase-rand(5,15), 2, 100);
+    if(team.sponsors.length && Math.random()<0.4) team.sponsors.pop();
+    pushNews(`${team.name}で不祥事が発覚し、ファン・スポンサーからの信頼が損なわれた。`, {stars:4, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+  }
+  if(won && team.standing<=1 && Math.random()<0.3){
+    pushNews(`${team.name}がリーグ優勝を果たした!ファンの熱狂とともに、グッズ・チケット販売が急増している。`, {stars:5, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+    queueCelebration("優勝!", `${team.name}がリーグ優勝を果たした。`);
+    team.fanbase = clamp(team.fanbase+rand(5,12), 2, 100);
+  }
+  team.lastSeasonDay = state.day;
+}
+function updateSportsTeams(v){
+  if(!v.sportsTeams || !v.sportsTeams.length) return;
+  v.sportsTeams.forEach(team=>{
+    if(team.status!=="active") return;
+    const seasonLen = SPORT_TYPES[team.sport].seasonDays;
+    if(state.day - team.lastSeasonDay >= seasonLen) processTeamSeason(v, team);
+    // 選手の加齢・キャリア進行(シーズンより緩やかな頻度で)
+    if((state.day - team.acquireDay) % 365 === 0){
+      team.roster = team.roster.map(p=>{
+        p.age += 1; p.contractYearsLeft = Math.max(0, p.contractYearsLeft-1);
+        const isEsports = team.sport==="esports";
+        const primeAge = isEsports ? 20 : 27;
+        if(p.age < primeAge-3) p.careerStage="rookie";
+        else if(p.age < primeAge+4) p.careerStage="prime";
+        else p.careerStage="veteran";
+        if(p.careerStage==="prime") p.skill = clamp(p.skill+rand(0,2), 20, 99);
+        else if(p.careerStage==="veteran") p.skill = clamp(p.skill-rand(0.5,3), 15, 99);
+        p.marketValue = Math.round(p.skill*p.skill*1_000_000*(isEsports?0.3:8)*(p.careerStage==="veteran"?0.6:1));
+        return p;
+      });
+      // 引退・新人補充
+      const retireAge = team.sport==="esports" ? 24 : 38;
+      const retiring = team.roster.filter(p=>p.age>=retireAge || (p.careerStage==="veteran" && Math.random()<0.15));
+      if(retiring.length){
+        team.roster = team.roster.filter(p=>!retiring.includes(p));
+        retiring.forEach(p=>{ if(!v.history) v.history=[]; v.history.push({day:state.day, text:`${team.name}の${p.name}選手が引退した`}); });
+        while(team.roster.length < SPORT_TYPES[team.sport].rosterSize+3) team.roster.push(generatePlayer(team.sport));
+      }
+    }
+  });
+}
+// eスポーツタイトルの人気が緩やかに変動し、低確率で新タイトルが登場する(既存タイトルの人気低下も伴う)
+function updateEsportsTitles(){
+  ensureEsportsTitles();
+  state.esportsTitles.forEach(t=>{ t.popularity = clamp(t.popularity + rand(-1.5,1.5), 5, 100); });
+  if(Math.random()<0.0003 && state.esportsTitles.length<10){
+    const genres = ["FPS","MOBA","バトルロイヤル","格闘ゲーム","スポーツゲーム","RTS"];
+    const newTitle = {key:"title"+Date.now(), label:`新作タイトル${state.esportsTitles.length+1}`, genre:pick(genres), popularity:rand(40,70)};
+    state.esportsTitles.push(newTitle);
+    state.esportsTitles.forEach(t=>{ if(t!==newTitle) t.popularity = clamp(t.popularity-rand(3,10), 5, 100); });
+    pushNews(`新作eスポーツタイトル「${newTitle.label}」が登場し、プレイヤー人口が急増している。`, {stars:4, kind:"confirmed", category:"general", type:"event"});
+  }
+}
+// チーム売却
+function sellSportsTeam(ventureId, teamId){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v) return {ok:false, msg:"対象企業が見つかりません"};
+  const team = (v.sportsTeams||[]).find(t=>t.id===teamId && t.status==="active");
+  if(!team) return {ok:false, msg:"対象チームが見つかりません"};
+  const strength = computeTeamStrength(team);
+  const value = Math.round((SPORT_TYPES[team.sport].acquireRange[0]+SPORT_TYPES[team.sport].acquireRange[1])/2 * (strength/60) * (team.fanbase/50) * rand(0.7,1.1));
+  team.status = "sold";
+  state.cash += value;
+  pushNews(`${v.name}が${team.name}を${fmtYen(value)}で売却した。`, {stars:3, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+  saveState();
+  return {ok:true, msg:`${team.name}を${fmtYen(value)}で売却しました`};
+}
+// 世界スポーツ企業ランキング(自社+NPCの簡易スコアで比較する)
+function computeSportsEmpireRanking(){
+  const entries = [];
+  state.ventures.forEach(v=>{
+    if(!v.sportsTeams || !v.sportsTeams.length) return;
+    const active = v.sportsTeams.filter(t=>t.status==="active");
+    if(!active.length) return;
+    const totalRevenue = active.reduce((s,t)=>s+(t.revenue||0),0);
+    const totalFans = active.reduce((s,t)=>s+t.fanbase,0);
+    entries.push({name:v.name, isPlayer:true, teams:active.length, revenue:totalRevenue, fans:totalFans});
+  });
+  // NPCの参考値(簡易生成。実企業データは持たないため目安として表示する)
+  for(let i=0;i<9;i++){
+    entries.push({name:`${pick(["グローバル","ワールド","パシフィック","コンチネンタル"])}スポーツHD${i+1}`, isPlayer:false, teams:randInt(1,6), revenue:rand(1e9,50e9), fans:randInt(20,90)*randInt(1,6)});
+  }
+  return entries.sort((a,b)=>b.revenue-a.revenue);
+}
+
 // 企業規模の安全弁: 個々の施策(研究開発/設備投資/特別イベント等)が散在して業績を掛け算で伸ばすため、
 // 個別の乗算箇所すべてを都度ダンピングする代わりに、ここで基準値からの倍率に上限を設ける(通常のプレイでは到達しない極端な暴走だけを防ぐ)
 function applyVentureScaleSafety(v){
@@ -4251,6 +4624,7 @@ function resolveIncomingHostileTob(v){
 
 function updateVentures(){
   checkIncomingTakeoverOffer();
+  updateEsportsTitles();
   state.ventures.forEach(v=>{
     if(v.incomingHostileTob && !v.incomingHostileTob.resolved && state.day>=v.incomingHostileTob.endDay){
       resolveIncomingHostileTob(v);
@@ -4258,6 +4632,8 @@ function updateVentures(){
     if(v.stage!=="private" && v.stage!=="listed") return;
     updateProductPipeline(v);
     updateNewBusinesses(v);
+    updateAlliances(v);
+    updateSportsTeams(v);
     checkFundraisingNeed(v);
     checkVentureFailureRisk(v);
     if(v.stage!=="private" && v.stage!=="listed") return; // 上記チェックで倒産/停滞した場合はここで処理を終える
@@ -7229,6 +7605,74 @@ function renderVentureModal(ventureId){
       </div>
 
       <div style="height:14px;"></div>
+      <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>事業ポートフォリオ</h2></div>
+      <div style="padding:10px 0;">
+        ${(()=>{ const portfolio = computeBusinessPortfolio(v); return portfolio.map(p=>`
+          <div style="margin-bottom:8px;">
+            <div style="display:flex; justify-content:space-between; font-size:11.5px;"><span>${p.label}</span><span>${p.pct.toFixed(0)}%</span></div>
+            <div style="height:6px; background:var(--panel-alt); border-radius:3px; margin-top:3px; overflow:hidden;"><div style="height:100%; width:${p.pct}%; background:var(--cyan);"></div></div>
+          </div>
+        `).join(""); })()}
+      </div>
+
+      <div style="height:14px;"></div>
+      <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>企業提携</h2></div>
+      <div style="padding:10px 0;">
+        ${(v.alliances||[]).filter(a=>a.active).length ? (v.alliances||[]).filter(a=>a.active).map(a=>`
+          <div class="row" style="cursor:default; flex-direction:column; align-items:flex-start; padding:8px 0;">
+            <div class="nm" style="font-size:12px;">${a.partnerName} <span class="badge info">${ALLIANCE_TYPES[a.type].label}${a.exclusive?'(独占)':''}</span></div>
+            <div class="sub">出資比率 自社${a.ownStake}% / 相手${100-a.ownStake}% ・ ${fmtDateShort(a.startDay)}〜</div>
+            <button class="btn btn-ghost btn-sm" style="margin-top:6px;" data-dissolve-alliance="${a.id}">提携を解消する</button>
+          </div>
+        `).join("") : `<div class="empty-state">現在、提携している企業はありません</div>`}
+        <div style="height:10px;"></div>
+        <div style="font-size:10.5px; color:var(--muted); margin-bottom:6px; font-family:var(--font-wide);">新たな提携を提案する</div>
+        <select id="alliance-partner-select" style="width:100%; background:var(--panel-alt); border:1px solid var(--line); color:var(--text); padding:8px; font-family:var(--font);">
+          ${getAlliancePartnerCandidates().slice(0,30).map(c=>`<option value="${c.id}">${c.name}(${c.sector}) 技術${c.techScore}/資金${c.capitalScore}</option>`).join("")}
+        </select>
+        <select id="alliance-type-select" style="width:100%; margin-top:8px; background:var(--panel-alt); border:1px solid var(--line); color:var(--text); padding:8px; font-family:var(--font);">
+          ${Object.entries(ALLIANCE_TYPES).map(([k,d])=>`<option value="${k}">${d.label} - ${d.desc}</option>`).join("")}
+        </select>
+        <div class="price-input-row" style="margin-top:8px;"><label>自社出資比率</label><input type="number" id="alliance-stake-input" value="50" min="10" max="90"></div>
+        <div style="display:flex; align-items:center; gap:6px; margin-top:6px;">
+          <input type="checkbox" id="alliance-exclusive-check">
+          <label for="alliance-exclusive-check" style="font-size:10.5px; color:var(--muted); font-family:var(--font-wide);">独占提携にする(他社と同時に提携できなくなる)</label>
+        </div>
+        <button class="btn btn-cyan btn-block btn-sm" id="btn-propose-alliance" style="margin-top:8px;">提携を提案する</button>
+      </div>
+
+      <div style="height:14px;"></div>
+      <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>スポーツ・eスポーツ事業</h2></div>
+      <div style="padding:10px 0;">
+        ${(v.sportsTeams||[]).filter(t=>t.status==="active").length ? (v.sportsTeams||[]).filter(t=>t.status==="active").map(team=>{
+          const strength = computeTeamStrength(team);
+          const titleLabel = team.esportsTitle ? (state.esportsTitles.find(t=>t.key===team.esportsTitle)||{}).label : null;
+          return `
+          <div class="row" style="cursor:default; flex-direction:column; align-items:flex-start; padding:8px 0; border-bottom:1px solid var(--line);">
+            <div class="nm" style="font-size:12px;">${team.name} <span class="badge info">${SPORT_TYPES[team.sport].label}${titleLabel?`(${titleLabel})`:''}</span></div>
+            <div class="sub">戦力${strength.toFixed(0)} ・ 順位${team.standing||'-'} ・ ファン${team.fanbase.toFixed(0)} ・ ロイヤルティ${team.loyalty.toFixed(0)}</div>
+            <div class="sub">年間売上${fmtYen(team.revenue||0)} ・ 年間利益${(team.profit||0)>=0?'+':''}${fmtYen(team.profit||0)} ・ スポンサー${(team.sponsors||[]).length}社</div>
+            <div class="sub">施設: スタジアム${(team.facilities.stadium||0).toFixed(0)} / 練習${(team.facilities.training||0).toFixed(0)}${team.facilities.youth!==undefined?` / ユース${team.facilities.youth.toFixed(0)}`:''}</div>
+            <div class="buy-sell-row" style="margin-top:6px; width:100%;">
+              <button class="btn btn-ghost btn-sm" data-team-facility="${team.id}:stadium">施設投資</button>
+              <button class="btn btn-ghost btn-sm" data-team-sponsor="${team.id}">スポンサー営業</button>
+              ${team.sport!=="esports" ? `<button class="btn btn-ghost btn-sm" data-team-naming="${team.id}">命名権売却</button>` : ''}
+              <button class="btn btn-red btn-sm" data-team-sell="${team.id}">売却</button>
+            </div>
+          </div>
+        `;}).join("") : `<div class="empty-state">スポーツ事業には未参入です</div>`}
+        <div style="height:10px;"></div>
+        <div style="font-size:10.5px; color:var(--muted); margin-bottom:6px; font-family:var(--font-wide);">新規チーム設立・買収</div>
+        <select id="sport-type-select" style="width:100%; background:var(--panel-alt); border:1px solid var(--line); color:var(--text); padding:8px; font-family:var(--font);">
+          ${Object.entries(SPORT_TYPES).map(([k,d])=>`<option value="${k}">${d.label}(設立目安${fmtYen(d.foundCost)} / 買収目安${fmtYen((d.acquireRange[0]+d.acquireRange[1])/2)})</option>`).join("")}
+        </select>
+        <div class="buy-sell-row" style="margin-top:8px;">
+          <button class="btn btn-ghost btn-block btn-sm" id="btn-found-team">新規設立する</button>
+          <button class="btn btn-red btn-block btn-sm" id="btn-acquire-team">既存チームを買収</button>
+        </div>
+      </div>
+
+      <div style="height:14px;"></div>
       ${v.stage==="private" ? `
       <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>IPO審査基準</h2></div>
       <table class="dtable">
@@ -7276,6 +7720,64 @@ function renderVentureModal(ventureId){
   modal.querySelectorAll('[data-invest-newbiz]').forEach(b=>{
     b.onclick = ()=>{
       const r = investInNewBusiness(v.id, b.dataset.investNewbiz, 500_000_000);
+      toast(r.msg); renderVentureModal(ventureId); render();
+    };
+  });
+  const proposeAllianceBtn = modal.querySelector('#btn-propose-alliance');
+  if(proposeAllianceBtn) proposeAllianceBtn.onclick = ()=>{
+    const partnerId = modal.querySelector('#alliance-partner-select').value;
+    const allianceType = modal.querySelector('#alliance-type-select').value;
+    const ownStake = parseInt(modal.querySelector('#alliance-stake-input').value)||50;
+    const exclusive = modal.querySelector('#alliance-exclusive-check').checked;
+    const r = proposeAlliance(v.id, partnerId, allianceType, {ownStake, exclusive});
+    toast(r.msg); renderVentureModal(ventureId); render();
+  };
+  modal.querySelectorAll('[data-dissolve-alliance]').forEach(b=>{
+    b.onclick = ()=>{
+      if(!confirm('この提携を解消しますか?')) return;
+      const r = dissolveAlliance(v.id, b.dataset.dissolveAlliance);
+      toast(r.msg); renderVentureModal(ventureId); render();
+    };
+  });
+  const foundTeamBtn = modal.querySelector('#btn-found-team');
+  if(foundTeamBtn) foundTeamBtn.onclick = ()=>{
+    const sport = modal.querySelector('#sport-type-select').value;
+    const r = foundSportsTeam(v.id, sport);
+    toast(r.msg); renderVentureModal(ventureId); render();
+  };
+  const acquireTeamBtn = modal.querySelector('#btn-acquire-team');
+  if(acquireTeamBtn) acquireTeamBtn.onclick = ()=>{
+    const sport = modal.querySelector('#sport-type-select').value;
+    if(!confirm(`${SPORT_TYPES[sport].label}チームの買収を検討します。よろしいですか?`)) return;
+    const r = acquireSportsTeam(v.id, sport);
+    toast(r.msg); renderVentureModal(ventureId); render();
+  };
+  modal.querySelectorAll('[data-team-facility]').forEach(b=>{
+    b.onclick = ()=>{
+      const [teamId, facilityKey] = b.dataset.teamFacility.split(":");
+      const amount = parseInt(prompt("投資額(円)を入力してください", "1000000000"))||0;
+      if(amount<=0) return;
+      const r = investInTeamFacility(v.id, teamId, facilityKey, amount);
+      toast(r.msg); renderVentureModal(ventureId); render();
+    };
+  });
+  modal.querySelectorAll('[data-team-sponsor]').forEach(b=>{
+    b.onclick = ()=>{
+      const r = seekSponsor(v.id, b.dataset.teamSponsor);
+      toast(r.msg); renderVentureModal(ventureId); render();
+    };
+  });
+  modal.querySelectorAll('[data-team-naming]').forEach(b=>{
+    b.onclick = ()=>{
+      const name = prompt("新しい施設名を入力してください(空欄で自動生成)","");
+      const r = sellNamingRights(v.id, b.dataset.teamNaming, name);
+      toast(r.msg); renderVentureModal(ventureId); render();
+    };
+  });
+  modal.querySelectorAll('[data-team-sell]').forEach(b=>{
+    b.onclick = ()=>{
+      if(!confirm('このチームを売却しますか?')) return;
+      const r = sellSportsTeam(v.id, b.dataset.teamSell);
       toast(r.msg); renderVentureModal(ventureId); render();
     };
   });
@@ -8446,6 +8948,7 @@ function migrateState(){
   if(!state.rivals || !state.rivals.length) state.rivals=generateRivals();
   if(state.activeTob===undefined) state.activeTob=null;
   if(!state.pendingBoardReactions) state.pendingBoardReactions=[];
+  if(!state.esportsTitles) state.esportsTitles = ESPORTS_TITLES_INITIAL.map(t=>({...t}));
   if(!state.marginAccount) state.marginAccount={opened:false, openedDay:null};
   if(!state.marginPositions) state.marginPositions=[];
   if(state.marginCall===undefined) state.marginCall=null;
@@ -8494,6 +8997,8 @@ function migrateState(){
     if(v.incomingOffer===undefined) v.incomingOffer = null;
     if(v.incomingHostileTob===undefined) v.incomingHostileTob = null;
     if(v.dividendPayoutRatio===undefined) v.dividendPayoutRatio = 0.15;
+    if(!v.alliances) v.alliances = [];
+    if(!v.sportsTeams) v.sportsTeams = [];
     if(!v.newBusinesses) v.newBusinesses = [];
     if(!v.history) v.history = [{day:v.acquireDay||1, text:`${v.name}を${ventureMethodLabel(v)}(投資額${fmtYen(v.investedCapital||0)})`}];
   });
