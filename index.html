@@ -9055,6 +9055,11 @@ function runOfflineCatchup(){
   state.stocks.forEach(s=>{ priceSnapshot[s.id]=s.price; });
   const marginPositionIdsBefore = new Set(state.marginPositions.map(p=>p.id));
   const marginCallBefore = !!state.marginCall;
+  // 経営中企業の不在中変化を追跡するためのスナップショット(買収提案・スポーツチーム成績)
+  const ventureOfferIdsBefore = new Set(state.ventures.filter(v=>v.incomingOffer).map(v=>v.id));
+  const ventureHostileTobIdsBefore = new Set(state.ventures.filter(v=>v.incomingHostileTob).map(v=>v.id));
+  const teamSnapshot = {};
+  state.ventures.forEach(v=>{ (v.sportsTeams||[]).forEach(t=>{ if(t.status==="active") teamSnapshot[t.id] = {standing:t.standing, fanbase:t.fanbase, sponsorCount:(t.sponsors||[]).length}; }); });
 
   suppressAutoSave = true;
 
@@ -9071,7 +9076,11 @@ function runOfflineCatchup(){
   const offlineNews = state.news.filter(n=>n.day>dayBeforeCatchup);
   const holdingIds = new Set(Object.keys(portfolioSnapshot));
   const ventureStockIds = new Set(state.ventures.filter(v=>v.listedStockId).map(v=>v.listedStockId));
-  const highlightNews = offlineNews.filter(n=> n.stars>=4 || (n.stockId && (holdingIds.has(n.stockId)||ventureStockIds.has(n.stockId)))).slice(0,15);
+  // 重要イベントを優先度(星の数)順に並べ、最大15件までを表示する
+  const highlightNews = offlineNews
+    .filter(n=> n.stars>=4 || (n.stockId && (holdingIds.has(n.stockId)||ventureStockIds.has(n.stockId))))
+    .sort((a,b)=> b.stars-a.stars || b.day-a.day)
+    .slice(0,15);
 
   const movers = Object.keys(portfolioSnapshot).map(id=>{
     const st = state.stocks.find(s=>s.id===id);
@@ -9082,6 +9091,24 @@ function runOfflineCatchup(){
   const newMarginPositions = state.marginPositions.filter(p=>!marginPositionIdsBefore.has(p.id)).length;
   const marginCallOccurred = !marginCallBefore && (!!state.marginCall || offlineNews.some(n=>n.category==='margin'));
 
+  // 新たに届いた買収提案・敵対的TOB(プレイヤー企業が対象)
+  const newOffers = state.ventures.filter(v=>v.incomingOffer && !ventureOfferIdsBefore.has(v.id)).map(v=>({ventureName:v.name, acquirer:v.incomingOffer.acquirer, offerPrice:v.incomingOffer.offerPrice}));
+  const newHostileTobs = state.ventures.filter(v=>v.incomingHostileTob && !ventureHostileTobIdsBefore.has(v.id)).map(v=>({ventureName:v.name, acquirer:v.incomingHostileTob.acquirer}));
+
+  // スポーツチームの不在中の成績変化(勝敗・ファン増減・スポンサー獲得)
+  const teamUpdates = [];
+  state.ventures.forEach(v=>{
+    (v.sportsTeams||[]).forEach(t=>{
+      const before = teamSnapshot[t.id];
+      if(!before || t.status!=="active") return;
+      const fanChangePct = before.fanbase>0 ? (t.fanbase/before.fanbase-1)*100 : 0;
+      const newSponsors = (t.sponsors||[]).length - before.sponsorCount;
+      if(Math.abs(fanChangePct)>=3 || newSponsors>0 || (before.standing && t.standing && before.standing!==t.standing)){
+        teamUpdates.push({name:t.name, sport:t.sport, standingBefore:before.standing, standingAfter:t.standing, fanChangePct, newSponsors});
+      }
+    });
+  });
+
   return {
     elapsedMs, elapsedHours, gameDaysSimulated: gameDaysToSimulate, capped,
     dayBeforeCatchup, dayAfter: state.day,
@@ -9089,7 +9116,39 @@ function runOfflineCatchup(){
     nikkeiBefore, nikkeiAfter: state.nikkei, nikkeiChangePct: nikkeiBefore>0 ? (state.nikkei/nikkeiBefore-1)*100 : 0,
     highlightNews, movers, totalNewsCount: offlineNews.length,
     newMarginPositions, marginCallOccurred,
+    newOffers, newHostileTobs, teamUpdates,
   };
+}
+// 長時間の不在の場合のみ、処理中であることを示す簡単なローディング画面を挟む
+// (JavaScriptは単一スレッドのため、真に段階的な進捗バーは実装せず、描画を1フレーム分待ってから
+//  実際のシミュレーションを実行する。処理自体は数百日規模でも数秒以内に収まるよう最大日数を制限している)
+async function runOfflineCatchupWithLoading(){
+  if(!state.lastWallClockTime) return runOfflineCatchup();
+  const elapsedHours = Math.max(0, (Date.now()-new Date(state.lastWallClockTime).getTime())/3_600_000);
+  if(elapsedHours >= 3){
+    openWorldUpdateLoadingModal(elapsedHours);
+    await new Promise(r=>setTimeout(r,120)); // ローディング画面を実際に描画させるための待機
+  }
+  return runOfflineCatchup();
+}
+function openWorldUpdateLoadingModal(elapsedHours){
+  showModal();
+  blockModalDismiss = true;
+  const modal = document.getElementById('modal');
+  const days = Math.floor(elapsedHours/24);
+  const hours = Math.floor(elapsedHours%24);
+  modal.innerHTML = `
+    <div class="modal-handle"></div>
+    <div style="text-align:center; padding:30px 10px;">
+      <div style="font-size:26px; margin-bottom:10px;">🌏</div>
+      <div style="font-size:13px; font-weight:800; font-family:var(--font-wide);">WORLD UPDATE</div>
+      <div style="font-size:11px; color:var(--muted); margin-top:6px; font-family:var(--font-wide);">経過時間 ${days>0?`${days}日`:''}${hours}時間</div>
+      <div style="margin-top:20px; font-size:11px; color:var(--muted); font-family:var(--font-wide);">世界を更新しています...</div>
+      <div style="height:6px; background:var(--panel-alt); border-radius:3px; margin:8px auto 0; max-width:220px; overflow:hidden;">
+        <div style="height:100%; width:70%; background:var(--cyan);"></div>
+      </div>
+    </div>
+  `;
 }
 function formatElapsedTime(ms){
   const totalMinutes = Math.floor(ms/1000/60);
@@ -9115,6 +9174,9 @@ function openOfflineSummaryModal(summary){
       <tr><td>📈 日経平均</td><td style="color:${summary.nikkeiChangePct>=0?'var(--green)':'var(--red)'};">${fmtPct(summary.nikkeiChangePct)}</td></tr>
       <tr><td>💰 あなたの総資産</td><td style="color:${summary.nwChange>=0?'var(--green)':'var(--red)'};">${nwSign}${fmtYen(summary.nwChange)}</td></tr>
       ${summary.movers.map(m=>`<tr><td>${m.pct>=0?'🔥':'⚠'} ${m.name}</td><td style="color:${m.pct>=0?'var(--green)':'var(--red)'};">${fmtPct(m.pct)}</td></tr>`).join("")}
+      ${(summary.newOffers||[]).map(o=>`<tr><td>💰 ${o.ventureName}</td><td style="color:var(--amber);">${o.acquirer}から買収提案(¥${fmtNum(o.offerPrice)})</td></tr>`).join("")}
+      ${(summary.newHostileTobs||[]).map(t=>`<tr><td>🚨 ${t.ventureName}</td><td style="color:var(--red);">${t.acquirer}が敵対的TOBを開始</td></tr>`).join("")}
+      ${(summary.teamUpdates||[]).slice(0,5).map(t=>`<tr><td>${(SPORT_TYPES[t.sport]||{}).emoji||'🏆'} ${t.name}</td><td>${t.standingBefore&&t.standingAfter&&t.standingBefore!==t.standingAfter?`順位${t.standingBefore}→${t.standingAfter}位 `:''}${Math.abs(t.fanChangePct)>=3?`ファン${t.fanChangePct>=0?'+':''}${t.fanChangePct.toFixed(0)}% `:''}${t.newSponsors>0?`新規スポンサー${t.newSponsors}件`:''}</td></tr>`).join("")}
       ${summary.newMarginPositions>0 ? `<tr><td>📋 信用取引</td><td>新規建玉 ${summary.newMarginPositions}件</td></tr>` : ''}
       ${summary.marginCallOccurred ? `<tr><td>⚠ 追証</td><td style="color:var(--red);">発生しています</td></tr>` : ''}
     </table>
@@ -9149,13 +9211,18 @@ async function boot(){
     state = initState();
   }
   migrateState();
-  const offlineSummary = runOfflineCatchup();
   render();
   startGameLoop();
   startPeriodicAutosave();
-  if(needsPlayerName()) openPlayerNameModal();
-  else if(offlineSummary) openOfflineSummaryModal(offlineSummary);
-  else if(!state.tutorialSeen) openTutorial();
+  if(needsPlayerName()){
+    openPlayerNameModal();
+  } else {
+    const offlineSummary = await runOfflineCatchupWithLoading();
+    blockModalDismiss = false;
+    if(offlineSummary) openOfflineSummaryModal(offlineSummary);
+    else if(!state.tutorialSeen) openTutorial();
+    else closeModal();
+  }
 }
 // 読み込んだセーブデータに不足しているフィールドを補完する(通常モード・デバッグモード共通で利用)
 // 既存の値は一切上書きしない。「存在しない項目にだけデフォルト値を設定する」方式を徹底する。
