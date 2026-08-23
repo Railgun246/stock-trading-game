@@ -147,7 +147,7 @@ canvas.chart{ width:100%; display:block; }
 
 #tabbar{ position:absolute; bottom:0; left:0; right:0; display:flex; background:#060A0F; border-top:1px solid var(--line); padding-bottom:env(safe-area-inset-bottom); }
 .tab-btn{ flex:1; background:none; border:none; color:var(--muted-2); padding:8px 0 6px; display:flex; flex-direction:column; align-items:center; gap:2px; cursor:pointer; min-width:0; }
-.tab-btn .ic{ font-size:15px; } .tab-btn .lb{ font-size:8.5px; font-weight:700; white-space:nowrap; font-family:var(--font-wide); }
+.tab-btn .ic{ font-size:15px; } .tab-btn .lb{ font-size:8px; font-weight:700; white-space:nowrap; font-family:var(--font-wide); }
 .tab-btn.active{ color:var(--cyan); }
 .tab-unread{ position:relative; }
 .tab-unread::after{ content:attr(data-count); position:absolute; top:-2px; right:calc(50% - 18px); background:var(--red); color:#fff; font-size:8px; font-weight:800; min-width:13px; height:13px; border-radius:7px; display:flex; align-items:center; justify-content:center; padding:0 2px; }
@@ -223,6 +223,7 @@ canvas.chart{ width:100%; display:block; }
     <button class="tab-btn" data-tab="portfolio"><span class="ic">&#9638;</span><span class="lb">保有/注文</span></button>
     <button class="tab-btn" data-tab="analysis"><span class="ic">&#9673;</span><span class="lb">分析</span></button>
     <button class="tab-btn" data-tab="company"><span class="ic">&#9632;</span><span class="lb">会社</span></button>
+    <button class="tab-btn" data-tab="sports"><span class="ic">&#9917;</span><span class="lb">エンタメ</span></button>
     <button class="tab-btn" data-tab="news"><span class="ic">&#9650;</span><span class="lb">ニュース</span></button>
   </div>
 </div>
@@ -3773,10 +3774,10 @@ function computeBusinessPortfolio(v){
    ventureTarget(v)へ反映することで、既存のファンダメンタルズ→株価システムに自然に接続する)
    ========================================================================== */
 const SPORT_TYPES = {
-  baseball:   {label:"プロ野球",       acquireRange:[100e9,300e9], foundCost:150e9, seasonDays:180, rosterSize:9},
-  soccer:     {label:"サッカー",       acquireRange:[80e9,200e9],  foundCost:100e9, seasonDays:150, rosterSize:11, hasYouth:true},
-  basketball: {label:"バスケットボール", acquireRange:[20e9,60e9],  foundCost:30e9,  seasonDays:120, rosterSize:5},
-  esports:    {label:"eスポーツ",      acquireRange:[2e9,8e9],     foundCost:3e9,   seasonDays:90,  rosterSize:5},
+  baseball:   {label:"プロ野球",       acquireRange:[100e9,300e9], foundCost:150e9, seasonDays:180, rosterSize:9, emoji:"⚾"},
+  soccer:     {label:"サッカー",       acquireRange:[80e9,200e9],  foundCost:100e9, seasonDays:150, rosterSize:11, hasYouth:true, emoji:"⚽"},
+  basketball: {label:"バスケットボール", acquireRange:[20e9,60e9],  foundCost:30e9,  seasonDays:120, rosterSize:5, emoji:"🏀"},
+  esports:    {label:"eスポーツ",      acquireRange:[2e9,8e9],     foundCost:3e9,   seasonDays:90,  rosterSize:5, emoji:"🎮"},
 };
 const ESPORTS_TITLES_INITIAL = [
   {key:"fps_valo", label:"ヴァロシューター", genre:"FPS", popularity:70},
@@ -3922,6 +3923,10 @@ function sellNamingRights(ventureId, teamId, newName){
 }
 // シーズン処理: 成績決定→ファン増減→収益計算(チケット・グッズ・スポンサー)→維持費控除→親会社業績への反映
 function processTeamSeason(v, team){
+  // 前期比較用のスナップショットを保存する(このシーズン処理で上書きされる前の値)
+  team.prevSeasonRevenue = team.revenue||0;
+  team.prevSeasonProfit = team.profit||0;
+  team.prevSeasonFanbase = team.fanbase;
   const strength = computeTeamStrength(team);
   const rivalStrength = clamp(strength + rand(-15,15), 10, 99); // 簡易的なライバルチームとの対戦結果
   const won = strength > rivalStrength;
@@ -3957,13 +3962,49 @@ function processTeamSeason(v, team){
     team.fanbase = clamp(team.fanbase-rand(5,15), 2, 100);
     if(team.sponsors.length && Math.random()<0.4) team.sponsors.pop();
     pushNews(`${team.name}で不祥事が発覚し、ファン・スポンサーからの信頼が損なわれた。`, {stars:4, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"event"});
+    if(!team.history) team.history=[]; team.history.push({day:state.day, text:"不祥事が発覚し、信頼が損なわれた"});
   }
   if(won && team.standing<=1 && Math.random()<0.3){
     pushNews(`${team.name}がリーグ優勝を果たした!ファンの熱狂とともに、グッズ・チケット販売が急増している。`, {stars:5, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
     queueCelebration("優勝!", `${team.name}がリーグ優勝を果たした。`);
     team.fanbase = clamp(team.fanbase+rand(5,12), 2, 100);
+    if(!team.history) team.history=[]; team.history.push({day:state.day, text:"リーグ優勝を果たした"});
   }
   team.lastSeasonDay = state.day;
+}
+// 選手市場(FA): チームごとに簡易的な移籍市場を都度生成する(常時同じ顔ぶれではなく、開くたびに市場感を出す)
+function getFreeAgentMarket(sport){
+  return Array.from({length:8}, ()=>generatePlayer(sport));
+}
+function signFreeAgent(ventureId, teamId, player){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v) return {ok:false, msg:"対象企業が見つかりません"};
+  const team = (v.sportsTeams||[]).find(t=>t.id===teamId && t.status==="active");
+  if(!team) return {ok:false, msg:"対象チームが見つかりません"};
+  const signingFee = Math.round(player.marketValue*0.15);
+  if((v.cashBalance||0)<signingFee) return {ok:false, msg:"契約金に必要な企業の現金が不足しています"};
+  v.cashBalance -= signingFee;
+  team.roster.push({...player, id:"pl"+Date.now()+randInt(0,9999)});
+  if(!team.history) team.history=[];
+  team.history.push({day:state.day, text:`${player.name}選手と契約(契約金${fmtYen(signingFee)})`});
+  pushNews(`${team.name}が${player.name}選手と契約金${fmtYen(signingFee)}で契約した。`, {stars:3, kind:"confirmed", category:"venture", stockId:v.listedStockId, type:"good"});
+  saveState();
+  return {ok:true, msg:`${player.name}選手と契約しました`};
+}
+// 選手放出(年俸の重い選手を放出して人件費を圧縮する)
+function releasePlayer(ventureId, teamId, playerId){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  if(!v) return {ok:false, msg:"対象企業が見つかりません"};
+  const team = (v.sportsTeams||[]).find(t=>t.id===teamId && t.status==="active");
+  if(!team) return {ok:false, msg:"対象チームが見つかりません"};
+  const idx = team.roster.findIndex(p=>p.id===playerId);
+  if(idx<0) return {ok:false, msg:"対象選手が見つかりません"};
+  const [player] = team.roster.splice(idx,1);
+  if(!team.history) team.history=[];
+  team.history.push({day:state.day, text:`${player.name}選手を放出した`});
+  team.roster.push(generatePlayer(team.sport)); // 最低限のロスター人数を維持する
+  saveState();
+  return {ok:true, msg:`${player.name}選手を放出しました`};
 }
 function updateSportsTeams(v){
   if(!v.sportsTeams || !v.sportsTeams.length) return;
@@ -5425,6 +5466,7 @@ function render(){
   if(currentTab==="portfolio") c.appendChild(renderPortfolio());
   if(currentTab==="analysis") c.appendChild(renderAnalysis());
   if(currentTab==="company") c.appendChild(renderCompany());
+  if(currentTab==="sports") c.appendChild(renderSportsTab());
   if(currentTab==="news") c.appendChild(renderNews());
 }
 // IPOタブに未読件数のバッジを表示する
@@ -6403,6 +6445,288 @@ function renderCompany(){
   },0);
 
   return wrap;
+}
+
+
+/* ---------- スポーツタブ ---------- */
+let sportsSubTab = "all"; // all | baseball | soccer | basketball | esports | ranking
+function getAllPlayerTeams(){
+  const teams = [];
+  state.ventures.forEach(v=>{
+    if(v.stage!=="private" && v.stage!=="listed") return;
+    (v.sportsTeams||[]).filter(t=>t.status==="active").forEach(t=> teams.push(Object.assign(t, {ventureId:v.id, ventureName:v.name})));
+  });
+  return teams;
+}
+function computeTeamValue(team){
+  const strength = computeTeamStrength(team);
+  const rosterValue = (team.roster||[]).reduce((s,p)=>s+p.marketValue,0);
+  const revenueMultiple = (team.revenue||0)*3;
+  const profitMultiple = Math.max(0,(team.profit||0))*8;
+  const fanValue = team.fanbase*1e8;
+  const facilityValue = ((team.facilities.stadium||0)+(team.facilities.training||0)+(team.facilities.youth||0))*2e8;
+  return Math.round(rosterValue*0.3 + revenueMultiple + profitMultiple + fanValue + facilityValue + strength*1e8);
+}
+function getManageableVentures(){ return state.ventures.filter(v=>v.stage==="private"||v.stage==="listed"); }
+function renderSportsTab(){
+  const wrap = document.createElement('div');
+  const teams = getAllPlayerTeams();
+  const totalValue = teams.reduce((s,t)=>s+computeTeamValue(t),0);
+  const totalRevenue = teams.reduce((s,t)=>s+(t.revenue||0),0);
+  const totalProfit = teams.reduce((s,t)=>s+(t.profit||0),0);
+  const totalFans = teams.reduce((s,t)=>s+t.fanbase,0);
+  const totalSponsor = teams.reduce((s,t)=>s+(t.sponsors||[]).reduce((a,b)=>a+b.amount,0),0);
+  const prevTotalRevenue = teams.reduce((s,t)=>s+(t.prevSeasonRevenue||0),0);
+  const growthPct = prevTotalRevenue>0 ? (totalRevenue/prevTotalRevenue-1)*100 : null;
+
+  wrap.appendChild(el(`
+    <div class="sec">
+      <div class="sec-head"><h2>スポーツ事業ダッシュボード</h2>${growthPct!==null?`<span class="sub ${growthPct>=0?'gain':'loss'}">${fmtPct(growthPct)}</span>`:''}</div>
+      <div class="grid-2">
+        <div class="stat-box"><div class="l">スポーツ事業価値</div><div class="v">${fmtYen(totalValue)}</div></div>
+        <div class="stat-box"><div class="l">年間売上</div><div class="v">${fmtYen(totalRevenue)}</div></div>
+        <div class="stat-box"><div class="l">年間利益</div><div class="v ${totalProfit>=0?'gain':'loss'}">${totalProfit>=0?'+':''}${fmtYen(totalProfit)}</div></div>
+        <div class="stat-box"><div class="l">ファン総数(万人)</div><div class="v">${totalFans.toFixed(0)}</div></div>
+        <div class="stat-box"><div class="l">保有チーム</div><div class="v">${teams.length}チーム</div></div>
+        <div class="stat-box"><div class="l">スポンサー収入</div><div class="v">${fmtYen(totalSponsor)}</div></div>
+      </div>
+    </div>
+  `));
+  const subtabRow = el(`
+    <div class="subtab-row">
+      <button class="subtab-btn ${sportsSubTab==='all'?'active':''}" data-sports-sub="all">全体</button>
+      <button class="subtab-btn ${sportsSubTab==='baseball'?'active':''}" data-sports-sub="baseball">野球</button>
+      <button class="subtab-btn ${sportsSubTab==='soccer'?'active':''}" data-sports-sub="soccer">サッカー</button>
+      <button class="subtab-btn ${sportsSubTab==='basketball'?'active':''}" data-sports-sub="basketball">バスケ</button>
+      <button class="subtab-btn ${sportsSubTab==='esports'?'active':''}" data-sports-sub="esports">eスポーツ</button>
+      <button class="subtab-btn ${sportsSubTab==='ranking'?'active':''}" data-sports-sub="ranking">世界ランキング</button>
+    </div>
+  `);
+  wrap.appendChild(subtabRow);
+  const body = document.createElement('div');
+  body.id = 'sports-subbody';
+  wrap.appendChild(body);
+
+  if(sportsSubTab==="ranking"){
+    const ranking = computeSportsEmpireRanking();
+    body.innerHTML = `
+      <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>世界スポーツ企業ランキング</h2></div>
+      ${ranking.slice(0,20).map((r,i)=>`
+        <div class="row" style="cursor:default;">
+          <div class="row-left"><div class="nm">${i+1}位 ${r.name}${r.isPlayer?' <span class="badge gain">自社</span>':''}</div><div class="sub">保有${r.teams}チーム ・ ファン${r.fans}万人</div></div>
+          <div class="row-right"><div class="px">${fmtYen(r.revenue)}</div></div>
+        </div>
+      `).join("")}
+    `;
+  } else {
+    const filtered = sportsSubTab==="all" ? teams : teams.filter(t=>t.sport===sportsSubTab);
+    const grouped = {};
+    filtered.forEach(t=>{ (grouped[t.sport]=grouped[t.sport]||[]).push(t); });
+    let html = "";
+    Object.entries(grouped).forEach(([sport, list])=>{
+      html += `<div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>${SPORT_TYPES[sport].emoji||''} ${SPORT_TYPES[sport].label}</h2></div>`;
+      list.forEach(team=>{
+        const strength = computeTeamStrength(team);
+        const titleLabel = team.esportsTitle ? (state.esportsTitles.find(t=>t.key===team.esportsTitle)||{}).label : null;
+        html += `
+          <div class="row" data-open-team="${team.ventureId}:${team.id}" style="cursor:pointer; flex-direction:column; align-items:flex-start; padding:10px 0; border-bottom:1px solid var(--line);">
+            <div style="display:flex; justify-content:space-between; width:100%;">
+              <div class="nm" style="font-size:12.5px; font-weight:800;">${team.name}${titleLabel?` <span class="badge info">${titleLabel}</span>`:''}</div>
+              <span style="font-size:10px; color:var(--muted);">${team.ventureName}</span>
+            </div>
+            <div class="sub" style="margin-top:2px;">総合力${strength.toFixed(0)} ・ 順位${team.standing||'-'} ・ ファン${team.fanbase.toFixed(0)}万人</div>
+            <div class="sub">年間利益 <span style="color:${(team.profit||0)>=0?'var(--green)':'var(--red)'};">${(team.profit||0)>=0?'+':''}${fmtYen(team.profit||0)}</span> ・ チーム価値 ${fmtYen(computeTeamValue(team))}</div>
+          </div>
+        `;
+      });
+    });
+    if(!filtered.length) html += `<div class="empty-state">${sportsSubTab==='all'?'まだチームを保有していません':`まだ${SPORT_TYPES[sportsSubTab].label}に参入していません`}</div>`;
+
+    const manageable = getManageableVentures();
+    html += `
+      <div style="height:14px;"></div>
+      <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>新規チーム設立・買収</h2></div>
+      <div class="sec-body" style="padding:10px 0;">
+        ${!manageable.length ? `<div class="empty-state">先に会社を創業・買収してください</div>` : `
+        ${manageable.length>1 ? `
+          <div style="font-size:9.5px; color:var(--muted); margin-bottom:4px; font-family:var(--font-wide);">運営会社</div>
+          <select id="sports-venture-select" style="width:100%; background:var(--panel-alt); border:1px solid var(--line); color:var(--text); padding:8px; font-family:var(--font); margin-bottom:8px;">
+            ${manageable.map(v=>`<option value="${v.id}">${v.name}</option>`).join("")}
+          </select>
+        ` : ''}
+        <select id="sport-type-select" style="width:100%; background:var(--panel-alt); border:1px solid var(--line); color:var(--text); padding:8px; font-family:var(--font);">
+          ${Object.entries(SPORT_TYPES).map(([k,d])=>`<option value="${k}">${d.label}(設立目安${fmtYen(d.foundCost)} / 買収目安${fmtYen((d.acquireRange[0]+d.acquireRange[1])/2)})</option>`).join("")}
+        </select>
+        <div class="buy-sell-row" style="margin-top:8px;">
+          <button class="btn btn-ghost btn-block btn-sm" id="btn-found-team">新規設立する</button>
+          <button class="btn btn-red btn-block btn-sm" id="btn-acquire-team">既存チームを買収</button>
+        </div>
+        `}
+      </div>
+    `;
+    body.innerHTML = html;
+  }
+
+  setTimeout(()=>{
+    document.querySelectorAll('[data-sports-sub]').forEach(b=>{ b.onclick=()=>{ sportsSubTab=b.dataset.sportsSub; render(); }; });
+    document.querySelectorAll('[data-open-team]').forEach(elm=>{
+      elm.onclick = ()=>{ const [ventureId,teamId]=elm.dataset.openTeam.split(":"); openTeamDetailModal(ventureId, teamId); };
+    });
+    const manageable = getManageableVentures();
+    const foundBtn = document.getElementById('btn-found-team');
+    if(foundBtn) foundBtn.onclick = ()=>{
+      const vId = manageable.length>1 ? document.getElementById('sports-venture-select').value : manageable[0].id;
+      const sport = document.getElementById('sport-type-select').value;
+      const r = foundSportsTeam(vId, sport);
+      toast(r.msg); render();
+    };
+    const acquireBtn = document.getElementById('btn-acquire-team');
+    if(acquireBtn) acquireBtn.onclick = ()=>{
+      const vId = manageable.length>1 ? document.getElementById('sports-venture-select').value : manageable[0].id;
+      const sport = document.getElementById('sport-type-select').value;
+      if(!confirm(`${SPORT_TYPES[sport].label}チームの買収を検討します。よろしいですか?`)) return;
+      const r = acquireSportsTeam(vId, sport);
+      toast(r.msg); render();
+    };
+  },0);
+
+  return wrap;
+}
+// チーム詳細画面(独立モーダル): 常時表示のヘッダー・競技成績/経営成績の分離・ゲージ・前期比較・ロスター・経営履歴
+function openTeamDetailModal(ventureId, teamId){ showModal(); renderTeamDetailModal(ventureId, teamId); }
+function renderTeamDetailModal(ventureId, teamId){
+  const v = state.ventures.find(x=>x.id===ventureId);
+  const modal = document.getElementById('modal');
+  if(!v){ modal.innerHTML = `<div class="modal-handle"></div><div class="empty-state">企業が見つかりません</div>`; return; }
+  const team = (v.sportsTeams||[]).find(t=>t.id===teamId);
+  if(!team){ modal.innerHTML = `<div class="modal-handle"></div><div class="empty-state">チームが見つかりません</div>`; return; }
+  const strength = computeTeamStrength(team);
+  const value = computeTeamValue(team);
+  const titleObj = team.esportsTitle ? state.esportsTitles.find(t=>t.key===team.esportsTitle) : null;
+  const salaryCost = (team.roster||[]).reduce((s,p)=>s+p.salary,0);
+  const facilityCost = ((team.facilities.stadium||0)+(team.facilities.training||0)+(team.facilities.youth||0))*5_000_000;
+  const sponsorTotal = (team.sponsors||[]).reduce((s,sp)=>s+sp.amount,0);
+  const gauge = (val)=> `<div style="height:6px; background:var(--panel-alt); border-radius:3px; overflow:hidden; margin-top:2px;"><div style="height:100%; width:${clamp(val,0,100)}%; background:var(--cyan);"></div></div>`;
+  const yoy = (cur, prev)=> prev ? `<span style="font-size:9.5px; color:${cur>=prev?'var(--green)':'var(--red)'}; margin-left:4px;">(${cur>=prev?'+':''}${((cur/prev-1)*100).toFixed(0)}%)</span>` : '';
+
+  modal.innerHTML = `
+    <div class="modal-handle"></div>
+    <div style="background:var(--panel-alt); margin:0 -14px 10px; padding:14px; border-bottom:1px solid var(--line);">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:15px; font-weight:800;">${team.name}</div>
+        <button class="modal-close" id="modal-close">✕</button>
+      </div>
+      <div style="font-size:10px; color:var(--muted); margin-top:2px; font-family:var(--font-wide);">${SPORT_TYPES[team.sport].label}${titleObj?`・${titleObj.label}`:''} ・ ${team.ventureName||v.name}</div>
+      <div style="display:flex; gap:14px; margin-top:8px; flex-wrap:wrap;">
+        <div><div style="font-size:9px; color:var(--muted);">総合力</div><div style="font-size:16px; font-weight:800;">${strength.toFixed(0)}</div></div>
+        <div><div style="font-size:9px; color:var(--muted);">${team.sport==='esports'?'世界ランキング':'順位'}</div><div style="font-size:16px; font-weight:800;">${team.standing||'-'}位</div></div>
+        <div><div style="font-size:9px; color:var(--muted);">ファン</div><div style="font-size:16px; font-weight:800;">${team.fanbase.toFixed(0)}万人</div></div>
+        <div><div style="font-size:9px; color:var(--muted);">チーム価値</div><div style="font-size:16px; font-weight:800;">${fmtYen(value)}</div></div>
+      </div>
+    </div>
+
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>競技成績</h2></div>
+    <div style="padding:8px 0;">
+      <div style="margin-bottom:6px;"><div style="display:flex; justify-content:space-between; font-size:11px;"><span>人気</span><span>${team.fanbase.toFixed(0)}</span></div>${gauge(team.fanbase)}</div>
+      <div style="margin-bottom:6px;"><div style="display:flex; justify-content:space-between; font-size:11px;"><span>ロイヤルティ</span><span>${team.loyalty.toFixed(0)}</span></div>${gauge(team.loyalty)}</div>
+      <div style="margin-bottom:6px;"><div style="display:flex; justify-content:space-between; font-size:11px;"><span>スタジアム</span><span>${(team.facilities.stadium||0).toFixed(0)}</span></div>${gauge(team.facilities.stadium||0)}</div>
+      <div style="margin-bottom:6px;"><div style="display:flex; justify-content:space-between; font-size:11px;"><span>練習施設</span><span>${(team.facilities.training||0).toFixed(0)}</span></div>${gauge(team.facilities.training||0)}</div>
+      ${team.facilities.youth!==undefined ? `<div style="margin-bottom:6px;"><div style="display:flex; justify-content:space-between; font-size:11px;"><span>ユースアカデミー</span><span>${team.facilities.youth.toFixed(0)}</span></div>${gauge(team.facilities.youth)}</div>` : ''}
+    </div>
+
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>経営成績</h2></div>
+    <table class="dtable">
+      <tr><td>年間売上</td><td>${fmtYen(team.revenue||0)}${yoy(team.revenue||0, team.prevSeasonRevenue)}</td></tr>
+      <tr><td>年間利益</td><td style="color:${(team.profit||0)>=0?'var(--green)':'var(--red)'};">${(team.profit||0)>=0?'+':''}${fmtYen(team.profit||0)}${yoy(team.profit||0, team.prevSeasonProfit)}</td></tr>
+      <tr><td>選手年俸(合計)</td><td>${fmtYen(salaryCost)}</td></tr>
+      <tr><td>施設維持費</td><td>${fmtYen(facilityCost)}</td></tr>
+      <tr><td>スポンサー収入</td><td>${fmtYen(sponsorTotal)}(${(team.sponsors||[]).length}社)</td></tr>
+      ${team.namingRights ? `<tr><td>命名権</td><td>${team.namingRights.name}</td></tr>` : ''}
+    </table>
+
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>ロスター(${(team.roster||[]).length}名)</h2></div>
+    <div style="max-height:220px; overflow-y:auto;">
+      ${(team.roster||[]).sort((a,b)=>b.skill-a.skill).map(p=>`
+        <div class="row" style="cursor:default;">
+          <div class="row-left"><div class="nm" style="font-size:11.5px;">${p.name} <span style="color:var(--muted); font-size:9.5px;">${p.age}歳・${p.careerStage==='rookie'?'新人':p.careerStage==='prime'?'全盛期':'ベテラン'}</span></div>
+            <div class="sub">総合${p.skill.toFixed(0)} ・ 年俸${fmtYen(p.salary)} ・ 契約残${p.contractYearsLeft}年</div></div>
+          <div class="row-right"><button class="btn btn-ghost btn-sm" data-release-player="${p.id}">放出</button></div>
+        </div>
+      `).join("")}
+    </div>
+
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>選手市場(FA)</h2></div>
+    <div id="fa-market-body" style="max-height:200px; overflow-y:auto;"></div>
+
+    <div style="height:14px;"></div>
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>経営履歴</h2></div>
+    <div style="padding:8px 0; font-size:11px; color:var(--muted); line-height:1.9; font-family:var(--font-wide);">
+      ${(team.history||[]).slice().reverse().slice(0,15).map(h=>`${fmtDateShort(h.day)} ${h.text}`).join("<br>")}
+    </div>
+
+    <div style="height:14px;"></div>
+    <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>経営</h2></div>
+    <div class="buy-sell-row" style="margin-top:8px;">
+      <button class="btn btn-ghost btn-block btn-sm" data-team-facility="${team.id}:stadium">スタジアム投資</button>
+      <button class="btn btn-ghost btn-block btn-sm" data-team-facility="${team.id}:training">練習施設投資</button>
+    </div>
+    ${team.facilities.youth!==undefined ? `<button class="btn btn-ghost btn-block btn-sm" style="margin-top:8px;" data-team-facility="${team.id}:youth">ユースアカデミー投資</button>` : ''}
+    <div class="buy-sell-row" style="margin-top:8px;">
+      <button class="btn btn-cyan btn-block btn-sm" data-team-sponsor="${team.id}">スポンサー営業</button>
+      ${team.sport!=="esports" ? `<button class="btn btn-ghost btn-block btn-sm" data-team-naming="${team.id}">命名権売却</button>` : ''}
+    </div>
+    <button class="btn btn-red btn-block btn-sm" style="margin-top:8px;" data-team-sell="${team.id}">チームを売却する</button>
+  `;
+  modal.querySelector('#modal-close').onclick = closeModal;
+
+  const faMarket = getFreeAgentMarket(team.sport);
+  document.getElementById('fa-market-body').innerHTML = faMarket.map((p,i)=>`
+    <div class="row" style="cursor:default;">
+      <div class="row-left"><div class="nm" style="font-size:11.5px;">${p.name} <span style="color:var(--muted); font-size:9.5px;">${p.age}歳</span></div>
+        <div class="sub">総合${p.skill.toFixed(0)} ・ 契約金目安${fmtYen(Math.round(p.marketValue*0.15))} ・ 年俸${fmtYen(p.salary)}</div></div>
+      <div class="row-right"><button class="btn btn-cyan btn-sm" data-sign-fa="${i}">契約</button></div>
+    </div>
+  `).join("");
+  modal.querySelectorAll('[data-sign-fa]').forEach(b=>{
+    b.onclick = ()=>{
+      const player = faMarket[parseInt(b.dataset.signFa)];
+      const r = signFreeAgent(v.id, team.id, player);
+      toast(r.msg); renderTeamDetailModal(ventureId, teamId);
+    };
+  });
+  modal.querySelectorAll('[data-release-player]').forEach(b=>{
+    b.onclick = ()=>{
+      if(!confirm('この選手を放出しますか?')) return;
+      const r = releasePlayer(v.id, team.id, b.dataset.releasePlayer);
+      toast(r.msg); renderTeamDetailModal(ventureId, teamId);
+    };
+  });
+  modal.querySelectorAll('[data-team-facility]').forEach(b=>{
+    b.onclick = ()=>{
+      const [, facilityKey] = b.dataset.teamFacility.split(":");
+      const amount = parseInt(prompt("投資額(円)を入力してください", "1000000000"))||0;
+      if(amount<=0) return;
+      const r = investInTeamFacility(v.id, team.id, facilityKey, amount);
+      toast(r.msg); renderTeamDetailModal(ventureId, teamId); render();
+    };
+  });
+  modal.querySelectorAll('[data-team-sponsor]').forEach(b=>{
+    b.onclick = ()=>{ const r = seekSponsor(v.id, team.id); toast(r.msg); renderTeamDetailModal(ventureId, teamId); render(); };
+  });
+  modal.querySelectorAll('[data-team-naming]').forEach(b=>{
+    b.onclick = ()=>{
+      const name = prompt("新しい施設名を入力してください(空欄で自動生成)","");
+      const r = sellNamingRights(v.id, team.id, name);
+      toast(r.msg); renderTeamDetailModal(ventureId, teamId); render();
+    };
+  });
+  modal.querySelectorAll('[data-team-sell]').forEach(b=>{
+    b.onclick = ()=>{
+      if(!confirm('このチームを売却しますか?')) return;
+      const r = sellSportsTeam(v.id, team.id);
+      toast(r.msg); closeModal(); render();
+    };
+  });
 }
 
 
@@ -7643,33 +7967,9 @@ function renderVentureModal(ventureId){
 
       <div style="height:14px;"></div>
       <div class="sec-head" style="margin:0 -14px; padding:8px 14px;"><h2>スポーツ・eスポーツ事業</h2></div>
-      <div style="padding:10px 0;">
-        ${(v.sportsTeams||[]).filter(t=>t.status==="active").length ? (v.sportsTeams||[]).filter(t=>t.status==="active").map(team=>{
-          const strength = computeTeamStrength(team);
-          const titleLabel = team.esportsTitle ? (state.esportsTitles.find(t=>t.key===team.esportsTitle)||{}).label : null;
-          return `
-          <div class="row" style="cursor:default; flex-direction:column; align-items:flex-start; padding:8px 0; border-bottom:1px solid var(--line);">
-            <div class="nm" style="font-size:12px;">${team.name} <span class="badge info">${SPORT_TYPES[team.sport].label}${titleLabel?`(${titleLabel})`:''}</span></div>
-            <div class="sub">戦力${strength.toFixed(0)} ・ 順位${team.standing||'-'} ・ ファン${team.fanbase.toFixed(0)} ・ ロイヤルティ${team.loyalty.toFixed(0)}</div>
-            <div class="sub">年間売上${fmtYen(team.revenue||0)} ・ 年間利益${(team.profit||0)>=0?'+':''}${fmtYen(team.profit||0)} ・ スポンサー${(team.sponsors||[]).length}社</div>
-            <div class="sub">施設: スタジアム${(team.facilities.stadium||0).toFixed(0)} / 練習${(team.facilities.training||0).toFixed(0)}${team.facilities.youth!==undefined?` / ユース${team.facilities.youth.toFixed(0)}`:''}</div>
-            <div class="buy-sell-row" style="margin-top:6px; width:100%;">
-              <button class="btn btn-ghost btn-sm" data-team-facility="${team.id}:stadium">施設投資</button>
-              <button class="btn btn-ghost btn-sm" data-team-sponsor="${team.id}">スポンサー営業</button>
-              ${team.sport!=="esports" ? `<button class="btn btn-ghost btn-sm" data-team-naming="${team.id}">命名権売却</button>` : ''}
-              <button class="btn btn-red btn-sm" data-team-sell="${team.id}">売却</button>
-            </div>
-          </div>
-        `;}).join("") : `<div class="empty-state">スポーツ事業には未参入です</div>`}
-        <div style="height:10px;"></div>
-        <div style="font-size:10.5px; color:var(--muted); margin-bottom:6px; font-family:var(--font-wide);">新規チーム設立・買収</div>
-        <select id="sport-type-select" style="width:100%; background:var(--panel-alt); border:1px solid var(--line); color:var(--text); padding:8px; font-family:var(--font);">
-          ${Object.entries(SPORT_TYPES).map(([k,d])=>`<option value="${k}">${d.label}(設立目安${fmtYen(d.foundCost)} / 買収目安${fmtYen((d.acquireRange[0]+d.acquireRange[1])/2)})</option>`).join("")}
-        </select>
-        <div class="buy-sell-row" style="margin-top:8px;">
-          <button class="btn btn-ghost btn-block btn-sm" id="btn-found-team">新規設立する</button>
-          <button class="btn btn-red btn-block btn-sm" id="btn-acquire-team">既存チームを買収</button>
-        </div>
+      <div class="sec-body" style="padding:10px 0;">
+        <div style="font-size:11px; color:var(--muted); margin-bottom:8px; font-family:var(--font-wide);">${(v.sportsTeams||[]).filter(t=>t.status==="active").length ? `${(v.sportsTeams||[]).filter(t=>t.status==="active").length}チームを保有中` : "スポーツ事業には未参入です"}</div>
+        <button class="btn btn-cyan btn-block btn-sm" id="btn-goto-sports-tab">エンタメタブで管理する →</button>
       </div>
 
       <div style="height:14px;"></div>
@@ -7739,48 +8039,8 @@ function renderVentureModal(ventureId){
       toast(r.msg); renderVentureModal(ventureId); render();
     };
   });
-  const foundTeamBtn = modal.querySelector('#btn-found-team');
-  if(foundTeamBtn) foundTeamBtn.onclick = ()=>{
-    const sport = modal.querySelector('#sport-type-select').value;
-    const r = foundSportsTeam(v.id, sport);
-    toast(r.msg); renderVentureModal(ventureId); render();
-  };
-  const acquireTeamBtn = modal.querySelector('#btn-acquire-team');
-  if(acquireTeamBtn) acquireTeamBtn.onclick = ()=>{
-    const sport = modal.querySelector('#sport-type-select').value;
-    if(!confirm(`${SPORT_TYPES[sport].label}チームの買収を検討します。よろしいですか?`)) return;
-    const r = acquireSportsTeam(v.id, sport);
-    toast(r.msg); renderVentureModal(ventureId); render();
-  };
-  modal.querySelectorAll('[data-team-facility]').forEach(b=>{
-    b.onclick = ()=>{
-      const [teamId, facilityKey] = b.dataset.teamFacility.split(":");
-      const amount = parseInt(prompt("投資額(円)を入力してください", "1000000000"))||0;
-      if(amount<=0) return;
-      const r = investInTeamFacility(v.id, teamId, facilityKey, amount);
-      toast(r.msg); renderVentureModal(ventureId); render();
-    };
-  });
-  modal.querySelectorAll('[data-team-sponsor]').forEach(b=>{
-    b.onclick = ()=>{
-      const r = seekSponsor(v.id, b.dataset.teamSponsor);
-      toast(r.msg); renderVentureModal(ventureId); render();
-    };
-  });
-  modal.querySelectorAll('[data-team-naming]').forEach(b=>{
-    b.onclick = ()=>{
-      const name = prompt("新しい施設名を入力してください(空欄で自動生成)","");
-      const r = sellNamingRights(v.id, b.dataset.teamNaming, name);
-      toast(r.msg); renderVentureModal(ventureId); render();
-    };
-  });
-  modal.querySelectorAll('[data-team-sell]').forEach(b=>{
-    b.onclick = ()=>{
-      if(!confirm('このチームを売却しますか?')) return;
-      const r = sellSportsTeam(v.id, b.dataset.teamSell);
-      toast(r.msg); renderVentureModal(ventureId); render();
-    };
-  });
+  const gotoSportsBtn = modal.querySelector('#btn-goto-sports-tab');
+  if(gotoSportsBtn) gotoSportsBtn.onclick = ()=>{ closeModal(); switchTab('sports'); };
   modal.querySelectorAll('[data-hire-exec]').forEach(b=>{
     b.onclick = ()=>{ const [pos,subtype]=b.dataset.hireExec.split(":"); const r=hireExecutive(v.id,pos,subtype); toast(r.msg); renderVentureModal(ventureId); render(); };
   });
